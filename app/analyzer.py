@@ -41,6 +41,26 @@ SYNTHESIS_SYSTEM_PROMPT = (
     "opakovania a nepodstatné detaily. Píš po slovensky."
 )
 
+MERGE_SYSTEM_PROMPT = (
+    "Si asistent, ktorý spravuje jeden priebežne rastúci dokument s pravidlami "
+    "obchodnej stratégie. Dostaneš (1) EXISTUJÚCI dokument so stratégiou a (2) "
+    "nové poznámky z ďalšieho videa o tej istej stratégii (napr. vysvetlenie "
+    "ďalšieho nástroja/konceptu, spresnenie pravidla). Tvoja úloha: zluč to do "
+    "jedného aktualizovaného, súdržného dokumentu — nové pravidlá pridaj na "
+    "vhodné miesto pod správny nadpis, existujúce pravidlá uprav/spresni ak ich "
+    "nové video dopĺňa alebo koriguje, nič nezduplikuj, zachovaj prehľadnú "
+    "štruktúru (rovnaký štýl nadpisov ako v existujúcom dokumente). Vráť CELÝ "
+    "výsledný dokument (nie len zmeny). Píš po slovensky."
+)
+
+CHANGELOG_SYSTEM_PROMPT = (
+    "Porovnaj PôVODNÚ a NOVÚ verziu dokumentu so stratégiou. Stručne v bodoch "
+    "zhrň, čo presne sa touto aktualizáciou zmenilo — čo pribudlo, čo sa "
+    "spresnilo/upravilo. Ak je 'pôvodná verzia' prázdna, ide o úplne prvé "
+    "vytvorenie dokumentu — zhrň, čo v ňom je. Píš stručne, po slovensky, "
+    "v odrážkach, bez nadpisu."
+)
+
 RESEARCH_NOTE_SYSTEM_PROMPT = (
     "Si asistent, ktorý sleduje video (akéhokoľvek druhu — prednáška, tutoriál, "
     "rozhovor, dokument, prezentácia...) a robí si stručné priebežné poznámky. "
@@ -139,3 +159,37 @@ def synthesize_notes(client, notes, model=DEFAULT_MODEL, system_prompt=None):
     ) as stream:
         message = stream.get_final_message()
     return _response_text(message), _usage_dict(message)
+
+
+def merge_notes(client, existing_document, notes, model=DEFAULT_MODEL):
+    """Zlúči nové priebežné poznámky do existujúceho dokumentu so stratégiou.
+    Vráti (aktualizovaný celý dokument, usage)."""
+    joined = "\n\n".join(notes)
+    with client.messages.stream(
+        model=model,
+        max_tokens=16000,
+        system=MERGE_SYSTEM_PROMPT,
+        messages=[{
+            "role": "user",
+            "content": (
+                f"EXISTUJÚCI dokument:\n\n{existing_document}\n\n"
+                f"---\n\nNOVÉ poznámky z ďalšieho videa:\n\n{joined}"
+            ),
+        }],
+    ) as stream:
+        message = stream.get_final_message()
+    return _response_text(message), _usage_dict(message)
+
+
+def summarize_changes(client, old_text, new_text, model=DEFAULT_MODEL):
+    """Zhrnie, čo sa medzi dvomi verziami dokumentu zmenilo. Vráti (text, usage)."""
+    response = client.messages.create(
+        model=model,
+        max_tokens=2048,
+        system=CHANGELOG_SYSTEM_PROMPT,
+        messages=[{
+            "role": "user",
+            "content": f"PÔVODNÁ verzia:\n\n{old_text or '(žiadna — ide o prvé vytvorenie)'}\n\n---\n\nNOVÁ verzia:\n\n{new_text}",
+        }],
+    )
+    return _response_text(response), _usage_dict(response)

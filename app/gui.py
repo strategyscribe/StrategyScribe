@@ -566,6 +566,7 @@ class App(ctk.CTk):
         self.app_mode_for_run = "full"
         self.run_temp_dir = None
         self.course_name_for_run = ""
+        self.append_target_for_run = None
         self.last_sound_time = None
         self.silence_warning_shown = False
         self.output_path = None
@@ -595,6 +596,19 @@ class App(ctk.CTk):
             mode_frame, values=[label for label, _ in APP_MODE_OPTIONS], variable=self.app_mode_var,
             command=self._on_app_mode_change, width=320,
         ).pack(side="left", padx=(8, 0))
+
+        self.append_frame = ctk.CTkFrame(self, fg_color="transparent")
+        self.append_var = ctk.BooleanVar(value=False)
+        ctk.CTkCheckBox(
+            self.append_frame, text="Pridať do existujúcej stratégie (namiesto novej)",
+            variable=self.append_var, command=self._on_append_toggle,
+        ).pack(side="left")
+        self.append_file_btn = ctk.CTkButton(
+            self.append_frame, text="Vybrať súbor...", width=110, command=self._pick_append_target,
+        )
+        self.append_target_path = None
+        self.append_target_label = ctk.CTkLabel(self, text="", text_color="gray70")
+        self._update_append_visibility()
 
         self.start_stop_btn = ctk.CTkButton(
             self, text="Štart", height=48, font=ctk.CTkFont(size=18, weight="bold"),
@@ -653,6 +667,38 @@ class App(ctk.CTk):
         mode = next((code for lbl, code in APP_MODE_OPTIONS if lbl == label), "full")
         self.cfg["app_mode"] = mode
         config_module.save(self.cfg)
+        self._update_append_visibility()
+
+    def _update_append_visibility(self):
+        mode = self.cfg.get("app_mode", "full")
+        if mode == "full":
+            self.append_frame.pack(fill="x", padx=20, pady=(0, 4))
+            if self.append_var.get():
+                self.append_file_btn.pack(side="left", padx=(10, 0))
+                self.append_target_label.pack(anchor="w", padx=20, pady=(0, 8))
+        else:
+            self.append_frame.pack_forget()
+            self.append_file_btn.pack_forget()
+            self.append_target_label.pack_forget()
+
+    def _on_append_toggle(self):
+        if self.append_var.get():
+            self.append_file_btn.pack(side="left", padx=(10, 0))
+            if self.append_target_path:
+                self.append_target_label.pack(anchor="w", padx=20, pady=(0, 8))
+        else:
+            self.append_file_btn.pack_forget()
+            self.append_target_label.pack_forget()
+
+    def _pick_append_target(self):
+        chosen = filedialog.askopenfilename(
+            title="Vyber existujúci súbor so stratégiou",
+            filetypes=[("Markdown", "*.md"), ("Všetky súbory", "*.*")],
+        )
+        if chosen:
+            self.append_target_path = Path(chosen)
+            self.append_target_label.configure(text=f"Pridá sa do: {self.append_target_path.name}")
+            self.append_target_label.pack(anchor="w", padx=20, pady=(0, 8))
 
     # ---------- Start / Stop ----------
 
@@ -745,6 +791,7 @@ class App(ctk.CTk):
         self.recording = False
         self.recording_indicator.hide()
         self.course_name_for_run = self.course_name_entry.get().strip()
+        self.append_target_for_run = self.append_target_path if self.append_var.get() else None
         self.start_stop_btn.configure(state="disabled", text="Spracúvam...")
         self._set_status("Zastavujem nahrávanie...")
         if self.screenshot_capture:
@@ -887,28 +934,63 @@ class App(ctk.CTk):
         if not notes:
             raise RuntimeError("Z videa sa nepodarilo získať žiadne konkrétne pravidlá stratégie.")
 
-        self._log(f"Priebežných poznámok: {len(notes)}. Vytváram finálnu syntézu...")
-        final_text, synth_usage = analyzer.synthesize_notes(
-            client, notes, model=ai_model, system_prompt=analyzer.SYNTHESIS_SYSTEM_PROMPT
-        )
+        append_target = self.append_target_for_run
+        previous_text = ""
+        if append_target:
+            if append_target.suffix == security.FILE_EXTENSION:
+                raise RuntimeError(
+                    "Vybraný súbor je zašifrovaný — appka ho nevie späť načítať "
+                    "(nemá súkromný kľúč). Pridávanie funguje len s nešifrovanými .md súbormi."
+                )
+            try:
+                previous_text = append_target.read_text(encoding="utf-8")
+            except OSError as exc:
+                raise RuntimeError(f"Nepodarilo sa načítať existujúci súbor: {exc}")
+            self._log(f"Pridávam k existujúcej stratégii: {append_target.name}...")
+            final_text, synth_usage = analyzer.merge_notes(
+                client, previous_text, notes, model=ai_model
+            )
+        else:
+            self._log(f"Priebežných poznámok: {len(notes)}. Vytváram finálnu syntézu...")
+            final_text, synth_usage = analyzer.synthesize_notes(
+                client, notes, model=ai_model, system_prompt=analyzer.SYNTHESIS_SYSTEM_PROMPT
+            )
         self._add_cost(analyzer.estimate_cost_usd(synth_usage, ai_model))
 
-        output_dir = Path(run_cfg.get("output_dir") or paths.get_default_output_dir())
-        output_dir.mkdir(parents=True, exist_ok=True)
-        course_name = self.course_name_for_run or "kurz"
-        safe_name = re.sub(r"[^\w\-]+", "_", course_name, flags=re.UNICODE).strip("_") or "kurz"
+        self._log("Zapisujem zhrnutie zmien tejto aktualizácie...")
+        changelog_text, changelog_usage = analyzer.summarize_changes(
+            client, previous_text, final_text, model=ai_model
+        )
+        self._add_cost(analyzer.estimate_cost_usd(changelog_usage, ai_model))
+
         date_part = datetime.now().strftime("%Y-%m-%d_%H-%M")
 
-        if run_cfg.get("encrypt_output"):
-            filename = f"{safe_name}_{date_part}{security.FILE_EXTENSION}"
-            output_path = output_dir / filename
-            encrypted = security.encrypt_text(final_text, run_cfg["encryption_public_key_pem"])
-            output_path.write_bytes(encrypted)
-            self._log("Výstup je zašifrovaný verejným kľúčom — rozšifruje ho len Bot Z / Aurion.")
+        if append_target:
+            output_path = append_target
+            safe_name = re.sub(r"[^\w\-]+", "_", append_target.stem, flags=re.UNICODE).strip("_") or "strategia"
         else:
-            filename = f"{safe_name}_{date_part}.md"
-            output_path = output_dir / filename
-            output_path.write_text(final_text, encoding="utf-8")
+            output_dir = Path(run_cfg.get("output_dir") or paths.get_default_output_dir())
+            output_dir.mkdir(parents=True, exist_ok=True)
+            course_name = self.course_name_for_run or "kurz"
+            safe_name = re.sub(r"[^\w\-]+", "_", course_name, flags=re.UNICODE).strip("_") or "kurz"
+            output_path = output_dir / f"{safe_name}_{date_part}.md"
+
+        # Vždy sa zapíše čitateľná .md verzia — je to "pracovná" kópia, z ktorej sa
+        # dá nabudúce pridávať ďalej (appka nevie čítať vlastný zašifrovaný výstup).
+        output_path.write_text(final_text, encoding="utf-8")
+
+        if run_cfg.get("encrypt_output"):
+            encrypted_path = output_path.with_name(f"{safe_name}_{date_part}{security.FILE_EXTENSION}")
+            encrypted = security.encrypt_text(final_text, run_cfg["encryption_public_key_pem"])
+            encrypted_path.write_bytes(encrypted)
+            self._log(
+                f"Zašifrovaná kópia pre Bot Z / Aurion uložená: {encrypted_path.name} "
+                "(pracovná .md kópia zostáva čitateľná, aby sa dalo nabudúce pridávať ďalej)."
+            )
+
+        changelog_path = output_path.with_name(f"{safe_name}_zmeny_{date_part}.docx")
+        docx_export.save_as_docx(changelog_text, changelog_path)
+        self._log(f"Zhrnutie zmien uložené: {changelog_path.name}")
 
         if not run_cfg.get("keep_temp_files", False):
             shutil.rmtree(self.run_temp_dir, ignore_errors=True)

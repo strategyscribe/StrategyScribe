@@ -15,7 +15,7 @@ from urllib.request import urlopen
 
 from . import gui
 
-APP_VERSION = "0.1.0"
+APP_VERSION = "0.1.1"
 GITHUB_REPO = "tomako21/StrategyScribe"
 UPDATE_CHECK_TIMEOUT = 4
 
