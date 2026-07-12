@@ -3,6 +3,7 @@ soundcard>=0.4.3
 proc-tap>=1.0.3
 pycaw>=20251023
 psutil>=7.0.0
+pywin32>=308
 numpy>=1.26.0
 faster-whisper>=1.0.3
 imageio-ffmpeg>=0.5.1

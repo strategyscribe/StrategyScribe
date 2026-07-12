@@ -28,6 +28,10 @@ def check_for_update():
             data = json.loads(response.read().decode("utf-8"))
         latest_tag = data.get("tag_name", "")
         release_url = data.get("html_url", f"https://github.com/{GITHUB_REPO}/releases")
+        # Bezpečnostná poistka: nikdy neotváraj nič mimo github.com, aj keby
+        # bola odpoveď API niekedy pozmenená (napr. cez skompromitovaný proxy).
+        if not release_url.startswith(f"https://github.com/{GITHUB_REPO}"):
+            return None
         if _parse_version(latest_tag) > _parse_version(APP_VERSION):
             return latest_tag, release_url
     except Exception:

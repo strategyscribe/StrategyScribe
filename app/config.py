@@ -1,8 +1,21 @@
-"""Načítanie a ukladanie nastavení appky (lokálny config.json súbor, mimo git)."""
+"""Načítanie a ukladanie nastavení appky (lokálny config.json súbor, mimo git).
 
+API kľúč sa na disku ukladá zašifrovaný cez Windows DPAPI (CryptProtectData) —
+viazaný na konkrétne Windows prihlásenie používateľa, takže je nečitateľný pre
+kohokoľvek iného/na inom počítači, aj keby súbor fyzicky skopíroval."""
+
+import base64
 import json
 
 from . import paths
+
+try:
+    import win32crypt
+    _DPAPI_AVAILABLE = True
+except ImportError:
+    _DPAPI_AVAILABLE = False
+
+_PROTECTED_PREFIX = "dpapi:"
 
 DEFAULT_CONFIG = {
     "app_mode": "full",  # "full", "video_only" alebo "audio_only"
@@ -28,6 +41,32 @@ DEFAULT_CONFIG = {
 }
 
 
+def _protect(plaintext):
+    """Zašifruje reťazec cez DPAPI, viazané na aktuálneho Windows používateľa."""
+    if not plaintext or not _DPAPI_AVAILABLE:
+        return plaintext
+    blob = win32crypt.CryptProtectData(
+        plaintext.encode("utf-8"), "StrategyScribe", None, None, None, 0
+    )
+    return _PROTECTED_PREFIX + base64.b64encode(blob).decode("ascii")
+
+
+def _unprotect(value):
+    """Opačná operácia. Stará (pred-DPAPI) konfigurácia mala kľúč v čistom
+    texte — taký sa vráti nezmenený a pri ďalšom uložení sa automaticky
+    zašifruje."""
+    if not value or not value.startswith(_PROTECTED_PREFIX):
+        return value
+    if not _DPAPI_AVAILABLE:
+        return ""
+    blob = base64.b64decode(value[len(_PROTECTED_PREFIX):])
+    try:
+        _, plaintext = win32crypt.CryptUnprotectData(blob, None, None, None, 0)
+    except Exception:
+        return ""  # napr. kľúč patrí inému Windows používateľovi/PC — nedá sa rozšifrovať
+    return plaintext.decode("utf-8")
+
+
 def load():
     """Načíta nastavenia z config.json. Chýbajúce polia doplní predvolenými hodnotami."""
     config = dict(DEFAULT_CONFIG)
@@ -37,11 +76,14 @@ def load():
             config.update(saved)
         except (json.JSONDecodeError, OSError):
             pass
+    config["api_key"] = _unprotect(config.get("api_key", ""))
     return config
 
 
 def save(config):
-    """Uloží nastavenia do config.json."""
+    """Uloží nastavenia do config.json (API kľúč zašifrovaný cez DPAPI)."""
+    to_save = dict(config)
+    to_save["api_key"] = _protect(config.get("api_key", ""))
     paths.CONFIG_PATH.write_text(
-        json.dumps(config, indent=2, ensure_ascii=False), encoding="utf-8"
+        json.dumps(to_save, indent=2, ensure_ascii=False), encoding="utf-8"
     )
