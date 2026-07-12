@@ -1,0 +1,15 @@
+config.json
+.env.local
+*.tmp
+temp/
+screenshots/
+audio/
+build/
+dist/
+*.exe
+*.spec
+__pycache__/
+*.pyc
+.venv/
+venv/
+.claude/
