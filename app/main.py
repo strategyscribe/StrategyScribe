@@ -19,7 +19,7 @@ from . import gui
 
 APP_VERSION = "0.1.1"
 GITHUB_REPO = "tomako21/StrategyScribe"
-UPDATE_CHECK_TIMEOUT = 4
+UPDATE_CHECK_TIMEOUT = 6
 
 DETACHED_PROCESS = 0x00000008
 CREATE_NEW_PROCESS_GROUP = 0x00000200
@@ -38,12 +38,19 @@ def check_for_update():
     Vráti dict s informáciami o vydaní (tag, release_url, exe_url, sha256_url)
     ak je dostupná novšia verzia, inak None. Pri akejkoľvek chybe (žiadny
     internet, repozitár ešte neexistuje, ...) sa ticho vzdá — kontrola
-    aktualizácie nesmie zabrániť spusteniu programu."""
+    aktualizácie nesmie zabrániť spusteniu programu. Na kolísavej sieti môže
+    jediný pokus s krátkym limitom zlyhať, preto skúša dvakrát."""
     url = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
-    try:
-        with urlopen(url, timeout=UPDATE_CHECK_TIMEOUT) as response:
-            data = json.loads(response.read().decode("utf-8"))
-    except Exception:
+    data = None
+    for attempt in range(2):
+        try:
+            with urlopen(url, timeout=UPDATE_CHECK_TIMEOUT) as response:
+                data = json.loads(response.read().decode("utf-8"))
+            break
+        except Exception:
+            if attempt == 0:
+                time.sleep(1)
+    if data is None:
         return None
 
     latest_tag = data.get("tag_name", "")
