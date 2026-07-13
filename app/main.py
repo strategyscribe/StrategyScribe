@@ -7,11 +7,12 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 import tkinter as tk
 import webbrowser
 from pathlib import Path
 from tkinter import messagebox, ttk
-from urllib.request import urlopen
+from urllib.request import Request, urlopen
 
 from . import gui
 
@@ -102,27 +103,66 @@ def _fetch_text(url, timeout=10):
         return response.read().decode("utf-8").strip()
 
 
-def _download_with_progress(url, dest_path, progress_window):
+DOWNLOAD_MAX_RETRIES = 8
+DOWNLOAD_READ_TIMEOUT = 30
+
+
+def _download_with_progress(url, dest_path, progress_window, max_retries=DOWNLOAD_MAX_RETRIES):
+    """Stiahne súbor s podporou pokračovania (HTTP Range) a opakovaných
+    pokusov — veľký súbor na pomalšom/nestabilnom pripojení môže inak
+    ľahko naraziť na timeout uprostred sťahovania. Vráti SHA-256 hash
+    kompletného súboru."""
     hasher = hashlib.sha256()
-    with urlopen(url, timeout=30) as response:
-        total = int(response.headers.get("Content-Length", 0))
-        downloaded = 0
-        with open(dest_path, "wb") as f:
-            while True:
-                chunk = response.read(256 * 1024)
-                if not chunk:
-                    break
-                f.write(chunk)
-                hasher.update(chunk)
-                downloaded += len(chunk)
-                if total:
-                    mb_done = downloaded / (1024 * 1024)
-                    mb_total = total / (1024 * 1024)
-                    progress_window.set_progress(
-                        downloaded / total,
-                        f"Sťahujem aktualizáciu... {mb_done:.0f} / {mb_total:.0f} MB",
-                    )
-    return hasher.hexdigest()
+    downloaded = 0
+    total = None
+
+    if dest_path.exists():
+        dest_path.unlink()
+
+    for attempt in range(1, max_retries + 1):
+        headers = {"Range": f"bytes={downloaded}-"} if downloaded else {}
+        request = Request(url, headers=headers)
+        try:
+            with urlopen(request, timeout=DOWNLOAD_READ_TIMEOUT) as response:
+                is_resumed = response.status == 206
+                if not is_resumed and downloaded:
+                    # Server nepodporuje Range (poslal by celý súbor odznova) —
+                    # začni nanovo, inak by sa obsah zdvojil.
+                    downloaded = 0
+                    hasher = hashlib.sha256()
+                    dest_path.unlink(missing_ok=True)
+                if total is None:
+                    content_range = response.headers.get("Content-Range", "")
+                    if "/" in content_range:
+                        total = int(content_range.rsplit("/", 1)[-1])
+                    else:
+                        total = int(response.headers.get("Content-Length", 0)) or None
+                mode = "ab" if downloaded else "wb"
+                with open(dest_path, mode) as f:
+                    while True:
+                        chunk = response.read(256 * 1024)
+                        if not chunk:
+                            break
+                        f.write(chunk)
+                        hasher.update(chunk)
+                        downloaded += len(chunk)
+                        if total:
+                            mb_done = downloaded / (1024 * 1024)
+                            mb_total = total / (1024 * 1024)
+                            progress_window.set_progress(
+                                downloaded / total,
+                                f"Sťahujem aktualizáciu... {mb_done:.0f} / {mb_total:.0f} MB",
+                            )
+            return hasher.hexdigest()
+        except Exception:
+            if attempt == max_retries:
+                raise
+            progress_window.set_progress(
+                (downloaded / total) if total else 0,
+                f"Výpadok siete, skúšam znova ({attempt}/{max_retries})...",
+            )
+            time.sleep(2)
+    raise RuntimeError("Sťahovanie zlyhalo po viacerých pokusoch.")
 
 
 def _apply_update(new_exe_path):
