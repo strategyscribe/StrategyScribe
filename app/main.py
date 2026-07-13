@@ -4,6 +4,7 @@ inštaláciu novej verzie, ak beží ako zbalené .exe), potom spustí GUI."""
 import hashlib
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -103,66 +104,76 @@ def _fetch_text(url, timeout=10):
         return response.read().decode("utf-8").strip()
 
 
-DOWNLOAD_MAX_RETRIES = 8
-DOWNLOAD_READ_TIMEOUT = 30
+DOWNLOAD_MAX_RETRIES = 10
+
+
+def _find_curl():
+    for candidate in ("curl.exe", "curl"):
+        path = shutil.which(candidate)
+        if path:
+            return path
+    # Windows 10 (1803+) / 11 vždy majú vstavaný System32\curl.exe, aj keby
+    # PATH bol z nejakého dôvodu nezvyčajný.
+    system32_curl = Path(os.environ.get("WINDIR", r"C:\Windows")) / "System32" / "curl.exe"
+    if system32_curl.exists():
+        return str(system32_curl)
+    raise RuntimeError("curl.exe sa nenašiel — automatická aktualizácia nie je možná.")
 
 
 def _download_with_progress(url, dest_path, progress_window, max_retries=DOWNLOAD_MAX_RETRIES):
-    """Stiahne súbor s podporou pokračovania (HTTP Range) a opakovaných
-    pokusov — veľký súbor na pomalšom/nestabilnom pripojení môže inak
-    ľahko naraziť na timeout uprostred sťahovania. Vráti SHA-256 hash
+    """Stiahne súbor cez systémový curl.exe (s podporou pokračovania -C - a
+    opakovaných pokusov --retry) — spoľahlivejšie na pomalších/nestabilných
+    pripojeniach než čisto Python riešenie. Počas sťahovania sleduje veľkosť
+    súboru na disku a priebežne aktualizuje progress bar. Vráti SHA-256 hash
     kompletného súboru."""
-    hasher = hashlib.sha256()
-    downloaded = 0
-    total = None
-
     if dest_path.exists():
         dest_path.unlink()
 
-    for attempt in range(1, max_retries + 1):
-        headers = {"Range": f"bytes={downloaded}-"} if downloaded else {}
-        request = Request(url, headers=headers)
-        try:
-            with urlopen(request, timeout=DOWNLOAD_READ_TIMEOUT) as response:
-                is_resumed = response.status == 206
-                if not is_resumed and downloaded:
-                    # Server nepodporuje Range (poslal by celý súbor odznova) —
-                    # začni nanovo, inak by sa obsah zdvojil.
-                    downloaded = 0
-                    hasher = hashlib.sha256()
-                    dest_path.unlink(missing_ok=True)
-                if total is None:
-                    content_range = response.headers.get("Content-Range", "")
-                    if "/" in content_range:
-                        total = int(content_range.rsplit("/", 1)[-1])
-                    else:
-                        total = int(response.headers.get("Content-Length", 0)) or None
-                mode = "ab" if downloaded else "wb"
-                with open(dest_path, mode) as f:
-                    while True:
-                        chunk = response.read(256 * 1024)
-                        if not chunk:
-                            break
-                        f.write(chunk)
-                        hasher.update(chunk)
-                        downloaded += len(chunk)
-                        if total:
-                            mb_done = downloaded / (1024 * 1024)
-                            mb_total = total / (1024 * 1024)
-                            progress_window.set_progress(
-                                downloaded / total,
-                                f"Sťahujem aktualizáciu... {mb_done:.0f} / {mb_total:.0f} MB",
-                            )
-            return hasher.hexdigest()
-        except Exception:
-            if attempt == max_retries:
-                raise
+    total = None
+    try:
+        head_request = Request(url, method="HEAD")
+        with urlopen(head_request, timeout=15) as response:
+            total = int(response.headers.get("Content-Length", 0)) or None
+    except Exception:
+        pass  # nekritické — progress bar bude bez celkového súčtu, sťahovanie beží ďalej
+
+    curl_exe = _find_curl()
+    process = subprocess.Popen(
+        [
+            curl_exe, "-L", "--fail", "--silent", "--show-error",
+            "--retry", str(max_retries), "--retry-delay", "2", "--retry-all-errors",
+            "-C", "-",
+            "-o", str(dest_path),
+            url,
+        ],
+        creationflags=subprocess.CREATE_NO_WINDOW,
+        stderr=subprocess.PIPE,
+    )
+
+    while process.poll() is None:
+        time.sleep(0.5)
+        size = dest_path.stat().st_size if dest_path.exists() else 0
+        if total:
             progress_window.set_progress(
-                (downloaded / total) if total else 0,
-                f"Výpadok siete, skúšam znova ({attempt}/{max_retries})...",
+                size / total,
+                f"Sťahujem aktualizáciu... {size / (1024*1024):.0f} / {total / (1024*1024):.0f} MB",
             )
-            time.sleep(2)
-    raise RuntimeError("Sťahovanie zlyhalo po viacerých pokusoch.")
+        else:
+            progress_window.set_progress(0, f"Sťahujem aktualizáciu... {size / (1024*1024):.0f} MB")
+
+    if process.returncode != 0:
+        stderr_text = (process.stderr.read() or b"").decode("utf-8", errors="ignore").strip()
+        raise RuntimeError(f"Sťahovanie zlyhalo (curl: {stderr_text or process.returncode}).")
+
+    progress_window.set_progress(1.0, "Overujem kontrolný súčet...")
+    hasher = hashlib.sha256()
+    with open(dest_path, "rb") as f:
+        while True:
+            chunk = f.read(1024 * 1024)
+            if not chunk:
+                break
+            hasher.update(chunk)
+    return hasher.hexdigest()
 
 
 def _apply_update(new_exe_path):
