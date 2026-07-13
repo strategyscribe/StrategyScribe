@@ -166,23 +166,37 @@ def _download_with_progress(url, dest_path, progress_window, max_retries=DOWNLOA
 
 
 def _apply_update(new_exe_path):
-    """Napíše a asynchrónne spustí .bat, ktorý počká kým sa appka ukončí,
-    nahradí .exe a znova ho spustí. Táto funkcia sa vracia hneď — volajúci
-    musí appku ihneď potom ukončiť (os._exit)."""
+    """Napíše a asynchrónne spustí .bat, ktorý počká kým úplne skončia VŠETKY
+    procesy bežiace z aktuálnej .exe cesty (PyInstaller onefile má pri behu
+    zvyčajne dva procesy — spúšťací aj samotnú appku, čakanie len na jeden PID
+    nestačí), nahradí .exe a znova ho spustí. Táto funkcia sa vracia hneď —
+    volajúci musí appku ihneď potom ukončiť (os._exit)."""
     current_exe = Path(sys.executable)
-    pid = os.getpid()
     bat_path = Path(tempfile.gettempdir()) / "strategyscribe_update.bat"
+    ps_still_running = (
+        f"if (Get-Process | Where-Object {{ $_.Path -eq '{current_exe}' }}) "
+        "{ exit 1 } else { exit 0 }"
+    )
     bat_content = (
         "@echo off\r\n"
         ":wait\r\n"
-        f'powershell -NoProfile -Command "if (Get-Process -Id {pid} -ErrorAction SilentlyContinue) '
-        '{ exit 1 } else { exit 0 }"\r\n'
+        f'powershell -NoProfile -Command "{ps_still_running}"\r\n'
         "if errorlevel 1 (\r\n"
         "    timeout /t 1 /nobreak >NUL\r\n"
         "    goto wait\r\n"
         ")\r\n"
-        f'move /Y "{new_exe_path}" "{current_exe}"\r\n'
+        "timeout /t 1 /nobreak >NUL\r\n"
+        "set MOVE_RETRY=0\r\n"
+        ":move\r\n"
+        f'move /Y "{new_exe_path}" "{current_exe}" >NUL 2>&1\r\n'
+        "if errorlevel 1 (\r\n"
+        "    set /a MOVE_RETRY+=1\r\n"
+        "    if %MOVE_RETRY% GEQ 10 goto giveup\r\n"
+        "    timeout /t 1 /nobreak >NUL\r\n"
+        "    goto move\r\n"
+        ")\r\n"
         f'start "" "{current_exe}"\r\n'
+        ":giveup\r\n"
         'del "%~f0"\r\n'
     )
     bat_path.write_text(bat_content, encoding="utf-8")
