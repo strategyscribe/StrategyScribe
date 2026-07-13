@@ -180,8 +180,16 @@ def _apply_update(new_exe_path):
     """Napíše a asynchrónne spustí .bat, ktorý počká kým úplne skončia VŠETKY
     procesy bežiace z aktuálnej .exe cesty (PyInstaller onefile má pri behu
     zvyčajne dva procesy — spúšťací aj samotnú appku, čakanie len na jeden PID
-    nestačí), nahradí .exe a znova ho spustí. Táto funkcia sa vracia hneď —
-    volajúci musí appku ihneď potom ukončiť (os._exit)."""
+    nestačí), nahradí .exe a znova ho spustí. Prvé spustenie čerstvo vymeneného
+    .exe môže zlyhať na "Failed to load Python DLL" (prechodný stav, kým
+    antivírus skenuje nový súbor) — preto .bat po spustení overuje, či sa
+    objavilo hlavné okno appky, a pri chybe spustenie zopakuje.
+
+    POZOR: tento .bat generuje VŽDY STARÁ (bežiaca) verzia appky — úpravy tu
+    sa prejavia až pri aktualizácii Z verzie, ktorá ich už obsahuje.
+
+    Táto funkcia sa vracia hneď — volajúci musí appku ihneď potom ukončiť
+    (os._exit)."""
     current_exe = Path(sys.executable)
     bat_path = Path(tempfile.gettempdir()) / "strategyscribe_update.bat"
     ps_still_running = (
@@ -206,7 +214,29 @@ def _apply_update(new_exe_path):
         "    timeout /t 1 /nobreak >NUL\r\n"
         "    goto move\r\n"
         ")\r\n"
+        "timeout /t 1 /nobreak >NUL\r\n"
+        "set START_RETRY=0\r\n"
+        ":startapp\r\n"
         f'start "" "{current_exe}"\r\n'
+        "set CHECK_COUNT=0\r\n"
+        ":checkloop\r\n"
+        "timeout /t 1 /nobreak >NUL\r\n"
+        "set /a CHECK_COUNT+=1\r\n"
+        f'powershell -NoProfile -Command "'
+        f"$ok = Get-Process | Where-Object {{ $_.Path -eq '{current_exe}' -and $_.MainWindowTitle -eq 'StrategyScribe' }}; "
+        "if ($ok) { exit 0 }; "
+        f"$err = Get-Process | Where-Object {{ $_.Path -eq '{current_exe}' -and $_.MainWindowTitle -eq 'Error' }}; "
+        'if ($err) { $err | Stop-Process -Force; exit 1 }; exit 2"\r\n'
+        "if errorlevel 2 (\r\n"
+        "    if %CHECK_COUNT% LSS 20 goto checkloop\r\n"
+        "    goto giveup\r\n"
+        ")\r\n"
+        "if errorlevel 1 (\r\n"
+        "    set /a START_RETRY+=1\r\n"
+        "    if %START_RETRY% GEQ 5 goto giveup\r\n"
+        "    timeout /t 3 /nobreak >NUL\r\n"
+        "    goto startapp\r\n"
+        ")\r\n"
         ":giveup\r\n"
         'del "%~f0"\r\n'
     )
