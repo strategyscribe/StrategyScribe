@@ -17,8 +17,11 @@ from urllib.request import Request, urlopen
 
 from . import gui
 
-APP_VERSION = "0.1.1"
-GITHUB_REPO = "tomako21/StrategyScribe"
+APP_VERSION = "0.1.2"
+GITHUB_REPO = "strategyscribe/StrategyScribe"
+# Repozitár bol presunutý z tomako21/StrategyScribe pod organizáciu — stará
+# adresa presmerováva na novú, obe sú dôveryhodné pre bezpečnostnú kontrolu.
+LEGACY_GITHUB_REPO = "tomako21/StrategyScribe"
 UPDATE_CHECK_TIMEOUT = 6
 
 DETACHED_PROCESS = 0x00000008
@@ -29,8 +32,10 @@ def _parse_version(tag):
     return tuple(int(p) for p in tag.lstrip("v").split(".") if p.isdigit())
 
 
-def _expected_asset_prefix():
-    return f"https://github.com/{GITHUB_REPO}/"
+def _trusted_url(url):
+    return url.startswith(f"https://github.com/{GITHUB_REPO}/") or url.startswith(
+        f"https://github.com/{LEGACY_GITHUB_REPO}/"
+    )
 
 
 def check_for_update():
@@ -57,7 +62,7 @@ def check_for_update():
     release_url = data.get("html_url", f"https://github.com/{GITHUB_REPO}/releases")
     # Bezpečnostná poistka: nikdy neotváraj/nesťahuj nič mimo github.com pre
     # tento repozitár, aj keby bola odpoveď API niekedy pozmenená.
-    if not release_url.startswith(_expected_asset_prefix()):
+    if not _trusted_url(release_url):
         return None
     if _parse_version(latest_tag) <= _parse_version(APP_VERSION):
         return None
@@ -67,7 +72,7 @@ def check_for_update():
     for asset in data.get("assets", []):
         name = asset.get("name", "")
         download_url = asset.get("browser_download_url", "")
-        if not download_url.startswith(_expected_asset_prefix()):
+        if not _trusted_url(download_url):
             continue
         if name == "StrategyScribe.exe":
             exe_url = download_url

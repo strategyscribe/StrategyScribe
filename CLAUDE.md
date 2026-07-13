@@ -161,10 +161,11 @@ Jedno okno, jednoducho:
 2. Nakoľko Whisper model je pomerne veľký, **neballiť ho priamo do .exe** —
    pri prvom spustení appka model stiahne sama (rýchlejšie sťahovanie inštalátora,
    používateľ vidí "Sťahujem jazykový model..." pri prvom spustení)
-3. **Distribúcia cez GitHub Releases** — nový repozitár (napr.
-   `github.com/tomako21/StrategyScribe`), ku každej verzii sa nahrá `.exe` ako
-   "Release", odkiaľ si ho vieš stiahnuť priamym linkom (a prípadne zdieľať
-   ďalej, ak by si chcel)
+3. **Distribúcia cez GitHub Releases** — repozitár
+   `github.com/strategyscribe/StrategyScribe` (pod neutrálnou organizáciou
+   `strategyscribe`, aby v odkazoch nebolo vidieť osobné meno; pôvodná adresa
+   `tomako21/StrategyScribe` presmerováva). Ku každej verzii sa nahrá `.exe` ako
+   "Release"; krátky verejný odkaz na stiahnutie: `tinyurl.com/strategyscribe`
 
 ---
 
