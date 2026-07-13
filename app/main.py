@@ -180,10 +180,15 @@ def _apply_update(new_exe_path):
     """Napíše a asynchrónne spustí .bat, ktorý počká kým úplne skončia VŠETKY
     procesy bežiace z aktuálnej .exe cesty (PyInstaller onefile má pri behu
     zvyčajne dva procesy — spúšťací aj samotnú appku, čakanie len na jeden PID
-    nestačí), nahradí .exe a znova ho spustí. Prvé spustenie čerstvo vymeneného
-    .exe môže zlyhať na "Failed to load Python DLL" (prechodný stav, kým
-    antivírus skenuje nový súbor) — preto .bat po spustení overuje, či sa
-    objavilo hlavné okno appky, a pri chybe spustenie zopakuje.
+    nestačí), nahradí .exe a znova ho spustí.
+
+    Skutočná príčina "Failed to load Python DLL" po výmene: .bat (spustený
+    ešte STOU appkou) dedí jej PyInstaller _PYI_* premenné prostredia, takže
+    novo spustené .exe si myslí, že je už rozbalené v STAROM (medzičasom
+    zmazanom) dočasnom priečinku. Oficiálna dokumentácia PyInstalleru na
+    presne tento prípad (spustenie nezávislej inštancie zo starej) odporúča
+    PYINSTALLER_RESET_ENVIRONMENT=1 — nastavené nižšie v .bat. Kontrola
+    hlavného okna + retry ostáva ako poistka pre iné prechodné zlyhania.
 
     POZOR: tento .bat generuje VŽDY STARÁ (bežiaca) verzia appky — úpravy tu
     sa prejavia až pri aktualizácii Z verzie, ktorá ich už obsahuje.
@@ -198,6 +203,7 @@ def _apply_update(new_exe_path):
     )
     bat_content = (
         "@echo off\r\n"
+        "set PYINSTALLER_RESET_ENVIRONMENT=1\r\n"
         ":wait\r\n"
         f'powershell -NoProfile -Command "{ps_still_running}"\r\n'
         "if errorlevel 1 (\r\n"
