@@ -61,6 +61,17 @@ CHANGELOG_SYSTEM_PROMPT = (
     "v odrážkach, bez nadpisu."
 )
 
+DOCUMENT_NOTE_SYSTEM_PROMPT = (
+    "Si asistent, ktorý číta študijný materiál k obchodnej (trading) stratégii "
+    "— napr. PDF príručku, e-book, prezentáciu alebo poznámky z kurzu. Dostaneš "
+    "časť dokumentu. Zapíš si z nej LEN konkrétne, overiteľné pravidlá a čísla "
+    "týkajúce sa stratégie (napr. veľkosť zóny, timeframe, podmienky "
+    "vstupu/výstupu, risk management, definície nástrojov a ich nastavenia) — "
+    "nič iné. Ak sú v dokumente grafy alebo obrázky, vyčítaj pravidlá aj z nich. "
+    "Ak táto časť neobsahuje žiadne konkrétne pravidlo, odpovedz presne jedným "
+    "slovom: PRESKOC. Píš po slovensky, stručne, v odrážkach."
+)
+
 RESEARCH_NOTE_SYSTEM_PROMPT = (
     "Si asistent, ktorý sleduje video (akéhokoľvek druhu — prednáška, tutoriál, "
     "rozhovor, dokument, prezentácia...) a robí si stručné priebežné poznámky. "
@@ -136,6 +147,39 @@ def analyze_segment(client, transcript_excerpt, screenshot_paths, model=DEFAULT_
             "role": "user",
             "content": [*image_blocks, {"type": "text", "text": f"Prepis:\n{transcript_excerpt}"}],
         }],
+    )
+    text = _response_text(response)
+    note = None if text.upper().startswith("PRESKOC") else text
+    return note, _usage_dict(response)
+
+
+def analyze_document_part(client, part, source_name, model=DEFAULT_MODEL):
+    """Pošle jednu časť dokumentu (PDF bytes alebo čistý text) na Claude a
+    vyťaží z nej pravidlá stratégie. Vráti (poznámka alebo None, usage) —
+    None keď časť neobsahuje nič podstatné."""
+    kind, payload = part
+    if kind == "pdf":
+        content = [
+            {
+                "type": "document",
+                "source": {
+                    "type": "base64",
+                    "media_type": "application/pdf",
+                    "data": base64.standard_b64encode(payload).decode("utf-8"),
+                },
+            },
+            {"type": "text", "text": f"Toto je časť dokumentu „{source_name}“."},
+        ]
+    else:
+        content = [{
+            "type": "text",
+            "text": f"Časť dokumentu „{source_name}“:\n\n{payload}",
+        }]
+    response = client.messages.create(
+        model=model,
+        max_tokens=4096,
+        system=DOCUMENT_NOTE_SYSTEM_PROMPT,
+        messages=[{"role": "user", "content": content}],
     )
     text = _response_text(response)
     note = None if text.upper().startswith("PRESKOC") else text

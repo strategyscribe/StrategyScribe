@@ -17,7 +17,7 @@ import customtkinter as ctk
 import mss
 from tkinter import filedialog, messagebox
 
-from . import analyzer, capture, config as config_module, docx_export, paths, security, transcribe
+from . import analyzer, capture, config as config_module, documents, docx_export, paths, security, transcribe
 
 ctk.set_appearance_mode("system")
 ctk.set_default_color_theme("blue")
@@ -606,6 +606,11 @@ class App(ctk.CTk):
         self.append_file_btn = ctk.CTkButton(
             self.append_frame, text="Vybrať súbor...", width=110, command=self._pick_append_target,
         )
+        self.docs_btn = ctk.CTkButton(
+            self.append_frame, text="Doplniť z dokumentov (PDF/Word)...", width=230,
+            fg_color="gray35", hover_color="gray25", command=self._on_add_documents,
+        )
+        self.docs_btn.pack(side="right")
         self.append_target_path = None
         self.append_target_label = ctk.CTkLabel(self, text="", text_color="gray70")
         self._update_append_visibility()
@@ -689,6 +694,138 @@ class App(ctk.CTk):
         else:
             self.append_file_btn.pack_forget()
             self.append_target_label.pack_forget()
+
+    def _on_add_documents(self):
+        """Doplnenie existujúcej stratégie z dokumentov (PDF/Word/text) — bez nahrávania."""
+        if self.recording or self.processing:
+            messagebox.showinfo(
+                "Prebieha práca", "Počkaj, kým skončí aktuálne nahrávanie alebo spracovanie."
+            )
+            return
+        if not self.cfg.get("api_key"):
+            messagebox.showwarning("Chýba API kľúč", "Najprv zadaj Claude API kľúč v Nastaveniach.")
+            return
+
+        if self.append_var.get() and self.append_target_path:
+            target = self.append_target_path
+        else:
+            chosen = filedialog.askopenfilename(
+                title="Vyber súbor so stratégiou, ktorú chceš doplniť",
+                filetypes=[("Markdown súbory", "*.md"), ("Textové súbory", "*.txt"), ("Všetky súbory", "*.*")],
+            )
+            if not chosen:
+                return
+            target = Path(chosen)
+        if target.suffix == security.FILE_EXTENSION:
+            messagebox.showerror(
+                "Zašifrovaný súbor",
+                "Vybraný súbor je zašifrovaný — appka ho nevie späť načítať (nemá súkromný "
+                "kľúč). Dopĺňanie funguje len s nešifrovanými .md súbormi.",
+            )
+            return
+
+        chosen_docs = filedialog.askopenfilenames(
+            title="Vyber dokumenty na doplnenie stratégie (môžeš označiť viac naraz)",
+            filetypes=[
+                ("Dokumenty (PDF, Word, text)", "*.pdf *.docx *.txt *.md"),
+                ("PDF súbory", "*.pdf"),
+                ("Word dokumenty", "*.docx"),
+                ("Textové súbory", "*.txt *.md"),
+            ],
+        )
+        doc_paths = [Path(d) for d in chosen_docs if Path(d) != target]
+        if not doc_paths:
+            return
+
+        self.processing = True
+        self.output_frame.pack_forget()
+        self.start_stop_btn.configure(state="disabled")
+        self.docs_btn.configure(state="disabled")
+        self.session_cost = 0.0
+        self.cost_label.configure(text="Odhadovaná cena tejto relácie: $0.000")
+        self._set_status("Spracúvam dokumenty...")
+        self._log(f"Dopĺňam stratégiu {target.name} z {len(doc_paths)} dokumentov...")
+        threading.Thread(
+            target=self._run_documents_pipeline, args=(target, doc_paths), daemon=True
+        ).start()
+
+    def _run_documents_pipeline(self, target, doc_paths):
+        try:
+            self._process_documents(target, doc_paths)
+        except Exception as exc:
+            self.msg_queue.put(("error", str(exc)))
+        finally:
+            self.msg_queue.put(("pipeline_done", None))
+
+    def _process_documents(self, target, doc_paths):
+        run_cfg = dict(self.cfg)
+        try:
+            previous_text = target.read_text(encoding="utf-8")
+        except OSError as exc:
+            raise RuntimeError(f"Nepodarilo sa načítať súbor so stratégiou: {exc}")
+
+        client = anthropic.Anthropic(api_key=run_cfg["api_key"])
+        ai_model = run_cfg.get("ai_model", analyzer.DEFAULT_MODEL)
+        cost_limit = run_cfg.get("cost_limit_usd", 0.0)
+        worker_cost_total = 0.0
+        notes = []
+        stopped_on_limit = False
+        for doc_path in doc_paths:
+            self._log(f"Čítam dokument: {doc_path.name}...")
+            parts = documents.load_document_parts(doc_path)
+            for j, part in enumerate(parts, start=1):
+                if cost_limit > 0 and worker_cost_total >= cost_limit:
+                    self._log(
+                        f"Dosiahnutý limit ceny (${cost_limit:.2f}) — zvyšok dokumentov "
+                        "sa nebude analyzovať."
+                    )
+                    stopped_on_limit = True
+                    break
+                self._log(f"Analyzujem {doc_path.name} — časť {j}/{len(parts)}...")
+                note, usage = analyzer.analyze_document_part(
+                    client, part, doc_path.name, model=ai_model
+                )
+                cost_delta = analyzer.estimate_cost_usd(usage, ai_model)
+                worker_cost_total += cost_delta
+                self._add_cost(cost_delta)
+                if note:
+                    notes.append(f"Z dokumentu „{doc_path.name}“:\n{note}")
+            if stopped_on_limit:
+                break
+
+        if not notes:
+            raise RuntimeError(
+                "Z dokumentov sa nepodarilo získať žiadne konkrétne pravidlá stratégie."
+            )
+
+        self._log(f"Získaných poznámok: {len(notes)}. Zlučujem do stratégie {target.name}...")
+        final_text, merge_usage = analyzer.merge_notes(client, previous_text, notes, model=ai_model)
+        self._add_cost(analyzer.estimate_cost_usd(merge_usage, ai_model))
+
+        self._log("Zapisujem zhrnutie zmien tejto aktualizácie...")
+        changelog_text, changelog_usage = analyzer.summarize_changes(
+            client, previous_text, final_text, model=ai_model
+        )
+        self._add_cost(analyzer.estimate_cost_usd(changelog_usage, ai_model))
+
+        date_part = datetime.now().strftime("%Y-%m-%d_%H-%M")
+        safe_name = re.sub(r"[^\w\-]+", "_", target.stem, flags=re.UNICODE).strip("_") or "strategia"
+        target.write_text(final_text, encoding="utf-8")
+
+        if run_cfg.get("encrypt_output"):
+            encrypted_path = target.with_name(f"{safe_name}_{date_part}{security.FILE_EXTENSION}")
+            encrypted = security.encrypt_text(final_text, run_cfg["encryption_public_key_pem"])
+            encrypted_path.write_bytes(encrypted)
+            self._log(
+                f"Zašifrovaná kópia pre Bot Z / Aurion uložená: {encrypted_path.name} "
+                "(pracovná .md kópia zostáva čitateľná, aby sa dalo nabudúce pridávať ďalej)."
+            )
+
+        changelog_path = target.with_name(f"{safe_name}_zmeny_{date_part}.docx")
+        docx_export.save_as_docx(changelog_text, changelog_path)
+        self._log(f"Zhrnutie zmien uložené: {changelog_path.name}")
+
+        self.msg_queue.put(("done", str(target)))
 
     def _pick_append_target(self):
         chosen = filedialog.askopenfilename(
@@ -779,6 +916,7 @@ class App(ctk.CTk):
         self.silence_warning_shown = False
         self.silence_warning_label.pack_forget()
         self.start_stop_btn.configure(text="Stop", fg_color="#b3261e", hover_color="#8c1d17")
+        self.docs_btn.configure(state="disabled")
         self.session_cost = 0.0
         self.cost_label.configure(text="Odhadovaná cena tejto relácie: $0.000")
         self._set_status("Nahrávam...")
@@ -1124,6 +1262,7 @@ class App(ctk.CTk):
                 state="normal", text="Štart",
                 fg_color=self._default_btn_fg, hover_color=self._default_btn_hover,
             )
+            self.docs_btn.configure(state="normal")
             self.vu_meter.set(0)
             self.silence_warning_label.pack_forget()
             self.silence_warning_shown = False

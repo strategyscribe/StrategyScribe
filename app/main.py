@@ -17,7 +17,7 @@ from urllib.request import Request, urlopen
 
 from . import gui
 
-APP_VERSION = "0.1.2"
+APP_VERSION = "0.1.3"
 GITHUB_REPO = "strategyscribe/StrategyScribe"
 # Repozitár bol presunutý z tomako21/StrategyScribe pod organizáciu — stará
 # adresa presmerováva na novú, obe sú dôveryhodné pre bezpečnostnú kontrolu.
