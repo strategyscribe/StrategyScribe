@@ -190,79 +190,123 @@ def _download_with_progress(url, dest_path, progress_window, max_retries=DOWNLOA
 
 
 def _apply_update(new_exe_path):
-    """Napíše a asynchrónne spustí .bat, ktorý počká kým úplne skončia VŠETKY
-    procesy bežiace z aktuálnej .exe cesty (PyInstaller onefile má pri behu
-    zvyčajne dva procesy — spúšťací aj samotnú appku, čakanie len na jeden PID
-    nestačí), nahradí .exe a znova ho spustí.
+    """Napíše a asynchrónne spustí PowerShell skript, ktorý dokončí aktualizáciu:
+    počká kým úplne skončia VŠETKY procesy bežiace z aktuálnej .exe cesty
+    (PyInstaller onefile má pri behu zvyčajne dva procesy), nahradí .exe a
+    spustí novú verziu. Počas celého priebehu ukazuje jedno normálne okno
+    „Inštalujem aktualizáciu…“ s priebehom — všetko beží v JEDNOM skrytom
+    procese (CREATE_NO_WINDOW), takže neblikajú žiadne konzolové okná (pôvodný
+    .bat spúšťal powershell/timeout v slučkách a každé volanie bliklo oknom).
 
-    Skutočná príčina "Failed to load Python DLL" po výmene: .bat (spustený
-    ešte STOU appkou) dedí jej PyInstaller _PYI_* premenné prostredia, takže
-    novo spustené .exe si myslí, že je už rozbalené v STAROM (medzičasom
-    zmazanom) dočasnom priečinku. Oficiálna dokumentácia PyInstalleru na
-    presne tento prípad (spustenie nezávislej inštancie zo starej) odporúča
-    PYINSTALLER_RESET_ENVIRONMENT=1 — nastavené nižšie v .bat. Kontrola
-    hlavného okna + retry ostáva ako poistka pre iné prechodné zlyhania.
+    "Failed to load Python DLL" po výmene rieši PYINSTALLER_RESET_ENVIRONMENT=1
+    (skript dedí _PYI_* premenné starej appky — nová inštancia sa musí správať
+    ako nezávislá; oficiálne odporúčanie PyInstalleru). Kontrola okna novej
+    verzie + opakované spustenie ostáva ako poistka.
 
-    POZOR: tento .bat generuje VŽDY STARÁ (bežiaca) verzia appky — úpravy tu
+    POZOR: tento skript generuje VŽDY STARÁ (bežiaca) verzia appky — úpravy tu
     sa prejavia až pri aktualizácii Z verzie, ktorá ich už obsahuje.
 
     Táto funkcia sa vracia hneď — volajúci musí appku ihneď potom ukončiť
     (os._exit)."""
     current_exe = Path(sys.executable)
-    bat_path = Path(tempfile.gettempdir()) / "strategyscribe_update.bat"
-    ps_still_running = (
-        f"if (Get-Process | Where-Object {{ $_.Path -eq '{current_exe}' }}) "
-        "{ exit 1 } else { exit 0 }"
-    )
-    bat_content = (
-        "@echo off\r\n"
-        "set PYINSTALLER_RESET_ENVIRONMENT=1\r\n"
-        ":wait\r\n"
-        f'powershell -NoProfile -Command "{ps_still_running}"\r\n'
-        "if errorlevel 1 (\r\n"
-        "    timeout /t 1 /nobreak >NUL\r\n"
-        "    goto wait\r\n"
-        ")\r\n"
-        "timeout /t 1 /nobreak >NUL\r\n"
-        "set MOVE_RETRY=0\r\n"
-        ":move\r\n"
-        f'move /Y "{new_exe_path}" "{current_exe}" >NUL 2>&1\r\n'
-        "if errorlevel 1 (\r\n"
-        "    set /a MOVE_RETRY+=1\r\n"
-        "    if %MOVE_RETRY% GEQ 10 goto giveup\r\n"
-        "    timeout /t 1 /nobreak >NUL\r\n"
-        "    goto move\r\n"
-        ")\r\n"
-        "timeout /t 1 /nobreak >NUL\r\n"
-        "set START_RETRY=0\r\n"
-        ":startapp\r\n"
-        f'start "" "{current_exe}"\r\n'
-        "set CHECK_COUNT=0\r\n"
-        ":checkloop\r\n"
-        "timeout /t 1 /nobreak >NUL\r\n"
-        "set /a CHECK_COUNT+=1\r\n"
-        f'powershell -NoProfile -Command "'
-        f"$ok = Get-Process | Where-Object {{ $_.Path -eq '{current_exe}' -and $_.MainWindowTitle -eq 'StrategyScribe' }}; "
-        "if ($ok) { exit 0 }; "
-        f"$err = Get-Process | Where-Object {{ $_.Path -eq '{current_exe}' -and $_.MainWindowTitle -eq 'Error' }}; "
-        'if ($err) { $err | Stop-Process -Force; exit 1 }; exit 2"\r\n'
-        "if errorlevel 2 (\r\n"
-        "    if %CHECK_COUNT% LSS 20 goto checkloop\r\n"
-        "    goto giveup\r\n"
-        ")\r\n"
-        "if errorlevel 1 (\r\n"
-        "    set /a START_RETRY+=1\r\n"
-        "    if %START_RETRY% GEQ 5 goto giveup\r\n"
-        "    timeout /t 3 /nobreak >NUL\r\n"
-        "    goto startapp\r\n"
-        ")\r\n"
-        ":giveup\r\n"
-        'del "%~f0"\r\n'
-    )
-    bat_path.write_text(bat_content, encoding="utf-8")
+    ps1_path = Path(tempfile.gettempdir()) / "strategyscribe_update.ps1"
+    ps1_content = f"""
+$exe = '{current_exe}'
+$new = '{new_exe_path}'
+
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
+$form = New-Object System.Windows.Forms.Form
+$form.Text = 'StrategyScribe — aktualizácia'
+$form.ClientSize = New-Object System.Drawing.Size(420, 110)
+$form.StartPosition = 'CenterScreen'
+$form.FormBorderStyle = 'FixedDialog'
+$form.MaximizeBox = $false
+$form.MinimizeBox = $false
+$form.ControlBox = $false
+$form.TopMost = $true
+$label = New-Object System.Windows.Forms.Label
+$label.Text = 'Inštalujem aktualizáciu...'
+$label.AutoSize = $true
+$label.Location = New-Object System.Drawing.Point(20, 20)
+$bar = New-Object System.Windows.Forms.ProgressBar
+$bar.Style = 'Marquee'
+$bar.MarqueeAnimationSpeed = 30
+$bar.Location = New-Object System.Drawing.Point(20, 55)
+$bar.Size = New-Object System.Drawing.Size(380, 22)
+$form.Controls.Add($label)
+$form.Controls.Add($bar)
+$form.Show()
+$form.Refresh()
+
+function Pump {{ [System.Windows.Forms.Application]::DoEvents() }}
+
+# 1. Pockaj, kym skoncia vsetky procesy povodnej verzie.
+$label.Text = 'Čakám na ukončenie programu...'
+Pump
+$deadline = (Get-Date).AddMinutes(3)
+while ((Get-Process | Where-Object {{ $_.Path -eq $exe }}) -and ((Get-Date) -lt $deadline)) {{
+    Pump
+    Start-Sleep -Milliseconds 400
+}}
+Start-Sleep -Seconds 1
+
+# 2. Vymen subor programu (s opakovanim, kym sa neuvolni).
+$label.Text = 'Vymieňam súbor programu...'
+Pump
+$moved = $false
+for ($i = 0; $i -lt 15; $i++) {{
+    try {{
+        Move-Item -Force -LiteralPath $new -Destination $exe -ErrorAction Stop
+        $moved = $true
+        break
+    }} catch {{
+        Pump
+        Start-Sleep -Seconds 1
+    }}
+}}
+if (-not $moved) {{
+    $label.Text = 'Aktualizácia zlyhala — spusti prosím program ručne.'
+    Pump
+    Start-Sleep -Seconds 5
+    $form.Close()
+    Remove-Item -LiteralPath $MyInvocation.MyCommand.Path -Force -ErrorAction SilentlyContinue
+    exit 1
+}}
+
+# 3. Spusti novu verziu ako nezavislu instanciu (reset PyInstaller prostredia).
+$label.Text = 'Spúšťam novú verziu...'
+Pump
+$env:PYINSTALLER_RESET_ENVIRONMENT = '1'
+for ($attempt = 1; $attempt -le 5; $attempt++) {{
+    Start-Process -FilePath $exe -WorkingDirectory (Split-Path $exe)
+    $started = $false
+    for ($i = 0; $i -lt 30; $i++) {{
+        Pump
+        Start-Sleep -Milliseconds 800
+        $err = Get-Process | Where-Object {{ $_.Path -eq $exe -and $_.MainWindowTitle -eq 'Error' }}
+        if ($err) {{
+            $err | Stop-Process -Force
+            break
+        }}
+        if (Get-Process | Where-Object {{ $_.Path -eq $exe -and $_.MainWindowTitle -and $_.MainWindowTitle -ne 'Error' }}) {{
+            $started = $true
+            break
+        }}
+    }}
+    if ($started) {{ break }}
+    Start-Sleep -Seconds 2
+}}
+
+$form.Close()
+Remove-Item -LiteralPath $MyInvocation.MyCommand.Path -Force -ErrorAction SilentlyContinue
+"""
+    # utf-8-sig (BOM): Windows PowerShell 5.1 bez BOM cita .ps1 ako ANSI a
+    # rozbil by slovenske znaky v textoch okna.
+    ps1_path.write_text(ps1_content, encoding="utf-8-sig")
     subprocess.Popen(
-        ["cmd.exe", "/c", str(bat_path)],
-        creationflags=DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP,
+        ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(ps1_path)],
+        creationflags=subprocess.CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP,
         close_fds=True,
     )
 
@@ -330,41 +374,35 @@ def _install_dir():
 
 def _spawn_downloaded_copy_cleanup(downloaded_exe, delete_config_too):
     """Asynchrónne zmaže stiahnutú kópiu .exe (a prípadne jej config.json) po
-    tom, čo úplne skončia všetky jej procesy — rovnaký vzor ako pri aktualizácii."""
-    bat_path = Path(tempfile.gettempdir()) / "strategyscribe_install_cleanup.bat"
-    ps_still_running = (
-        f"if (Get-Process | Where-Object {{ $_.Path -eq '{downloaded_exe}' }}) "
-        "{ exit 1 } else { exit 0 }"
-    )
+    tom, čo úplne skončia všetky jej procesy. Beží ako JEDEN skrytý PowerShell
+    proces (CREATE_NO_WINDOW) — žiadne blikajúce konzolové okná."""
+    ps1_path = Path(tempfile.gettempdir()) / "strategyscribe_install_cleanup.ps1"
     config_line = ""
     if delete_config_too:
-        config_line = f'del "{downloaded_exe.parent / "config.json"}" >NUL 2>&1\r\n'
-    bat_content = (
-        "@echo off\r\n"
-        ":wait\r\n"
-        f'powershell -NoProfile -Command "{ps_still_running}"\r\n'
-        "if errorlevel 1 (\r\n"
-        "    timeout /t 1 /nobreak >NUL\r\n"
-        "    goto wait\r\n"
-        ")\r\n"
-        "timeout /t 1 /nobreak >NUL\r\n"
-        "set DEL_RETRY=0\r\n"
-        ":delloop\r\n"
-        f'del "{downloaded_exe}" >NUL 2>&1\r\n'
-        f'if exist "{downloaded_exe}" (\r\n'
-        "    set /a DEL_RETRY+=1\r\n"
-        "    if %DEL_RETRY% GEQ 10 goto cleanup\r\n"
-        "    timeout /t 1 /nobreak >NUL\r\n"
-        "    goto delloop\r\n"
-        ")\r\n"
-        f"{config_line}"
-        ":cleanup\r\n"
-        'del "%~f0"\r\n'
-    )
-    bat_path.write_text(bat_content, encoding="utf-8")
+        config_path = downloaded_exe.parent / "config.json"
+        config_line = f"Remove-Item -LiteralPath '{config_path}' -Force -ErrorAction SilentlyContinue"
+    ps1_content = f"""
+$exe = '{downloaded_exe}'
+$deadline = (Get-Date).AddMinutes(3)
+while ((Get-Process | Where-Object {{ $_.Path -eq $exe }}) -and ((Get-Date) -lt $deadline)) {{
+    Start-Sleep -Milliseconds 400
+}}
+Start-Sleep -Seconds 1
+for ($i = 0; $i -lt 10; $i++) {{
+    try {{
+        Remove-Item -LiteralPath $exe -Force -ErrorAction Stop
+        break
+    }} catch {{
+        Start-Sleep -Seconds 1
+    }}
+}}
+{config_line}
+Remove-Item -LiteralPath $MyInvocation.MyCommand.Path -Force -ErrorAction SilentlyContinue
+"""
+    ps1_path.write_text(ps1_content, encoding="utf-8-sig")
     subprocess.Popen(
-        ["cmd.exe", "/c", str(bat_path)],
-        creationflags=DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP,
+        ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(ps1_path)],
+        creationflags=subprocess.CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP,
         close_fds=True,
     )
 
@@ -394,16 +432,16 @@ def _self_install_check():
         question = (
             f"StrategyScribe je už nainštalovaný v:\n{install_dir}\n\n"
             "Chceš nainštalovanú verziu nahradiť touto kópiou a spustiť ju?\n"
-            "Táto stiahnutá kópia sa potom automaticky zmaže, aby sa na disku "
-            "nehromadili staré verzie.\n\n"
+            "Obnoví sa aj odkaz na pracovnej ploche a táto stiahnutá kópia sa "
+            "potom automaticky zmaže, aby sa na disku nehromadili staré verzie.\n\n"
             "(Nie = program pobeží priamo z tohto súboru a už sa nebude pýtať.)"
         )
     else:
         question = (
             f"Chceš StrategyScribe nainštalovať na stále miesto?\n{install_dir}\n\n"
-            "Program tak bude na jednom mieste (odkaz na ploche aj aktualizácie "
-            "budú vždy smerovať naň) a táto stiahnutá kópia sa po inštalácii "
-            "automaticky zmaže.\n\n"
+            "Vytvorí sa odkaz na pracovnej ploche, program bude na jednom mieste "
+            "(aktualizácie budú vždy smerovať naň) a táto stiahnutá kópia sa po "
+            "inštalácii automaticky zmaže.\n\n"
             "(Nie = program pobeží priamo z tohto súboru a už sa nebude pýtať.)"
         )
     should_install = messagebox.askyesno("Inštalácia StrategyScribe", question)
@@ -433,6 +471,25 @@ def _self_install_check():
         if current_config.exists() and not installed_config.exists():
             shutil.copy2(current_config, installed_config)
             config_migrated = True
+
+        # Odkaz na ploche je súčasť inštalácie (v dialógu vyššie to bolo
+        # oznámené) — a nainštalovaná kópia sa naň už nemá pýtať znova.
+        from . import paths as paths_module
+
+        try:
+            paths_module.create_desktop_shortcut(target=installed_exe)
+        except Exception:
+            pass  # bez odkazu sa dá žiť — dá sa vytvoriť v Nastaveniach
+        try:
+            installed_cfg_data = {}
+            if installed_config.exists():
+                installed_cfg_data = json.loads(installed_config.read_text(encoding="utf-8"))
+            installed_cfg_data["desktop_shortcut_offered"] = True
+            installed_config.write_text(
+                json.dumps(installed_cfg_data, indent=2, ensure_ascii=False), encoding="utf-8"
+            )
+        except Exception:
+            pass
     except Exception as exc:
         messagebox.showerror(
             "Inštalácia zlyhala",

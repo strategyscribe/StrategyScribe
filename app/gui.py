@@ -16,6 +16,7 @@ from pathlib import Path
 import anthropic
 import customtkinter as ctk
 import mss
+from PIL import Image
 from tkinter import filedialog, messagebox
 
 from . import analyzer, capture, config as config_module, documents, docx_export, paths, security, transcribe
@@ -55,6 +56,15 @@ SILENCE_THRESHOLD = 0.02
 SILENCE_WARNING_SECONDS = 5
 BLOCK_SECONDS = 180
 SCREENSHOTS_PER_BLOCK = 3
+# Krátke výpadky internetu sú bežné — SDK samo opakuje jednotlivé volania,
+# kritické kroky navyše opakujeme aj my s dlhšou pauzou.
+API_MAX_RETRIES = 5
+CRITICAL_CALL_ATTEMPTS = 3
+CRITICAL_CALL_RETRY_PAUSE = 15
+
+
+def _make_api_client(api_key):
+    return anthropic.Anthropic(api_key=api_key, max_retries=API_MAX_RETRIES)
 
 
 class RegionSelector(ctk.CTkToplevel):
@@ -174,6 +184,108 @@ class RecordingIndicator(ctk.CTkToplevel):
 
     def hide(self):
         self.withdraw()
+
+
+class LivePreviewWindow(ctk.CTkToplevel):
+    """Živý náhľad počas nahrávania — druhé okno s miniatúrou zachytávaného
+    obrazu a ukazovateľom zvuku, aby používateľ hneď videl, že appka naozaj
+    vidí a počuje to, čo má. Rovnako ako indikátor nahrávania je vylúčené zo
+    samotného záznamu (WDA_EXCLUDEFROMCAPTURE), takže sa nenahrá samo do seba."""
+
+    WDA_EXCLUDEFROMCAPTURE = 0x00000011
+    GA_ROOT = 2
+    REFRESH_MS = 1000
+    THUMB_WIDTH = 420
+
+    def __init__(self, master, monitor_index=0, region=None, show_video=True, show_audio=True):
+        super().__init__(master)
+        self.title("Živý náhľad nahrávania")
+        self.resizable(False, False)
+        self.attributes("-topmost", True)
+        # Zatvorenie okna náhľad len skryje — nahrávanie beží ďalej.
+        self.protocol("WM_DELETE_WINDOW", self.withdraw)
+        self._monitor_index = monitor_index
+        self._region = region
+        self._closed = False
+        self._ctk_image = None
+        self._last_sound_time = time.monotonic()
+
+        if show_video:
+            self.image_label = ctk.CTkLabel(self, text="Pripravujem náhľad obrazu...", width=self.THUMB_WIDTH)
+            self.image_label.pack(padx=12, pady=(12, 6))
+        else:
+            self.image_label = None
+
+        if show_audio:
+            audio_frame = ctk.CTkFrame(self, fg_color="transparent")
+            audio_frame.pack(fill="x", padx=12, pady=(0, 4))
+            ctk.CTkLabel(audio_frame, text="Zvuk:").pack(side="left")
+            self.audio_meter = ctk.CTkProgressBar(audio_frame, width=self.THUMB_WIDTH - 60)
+            self.audio_meter.set(0)
+            self.audio_meter.pack(side="left", padx=(8, 0))
+            self.audio_status = ctk.CTkLabel(self, text="Čakám na zvuk...", text_color="gray70")
+            self.audio_status.pack(anchor="w", padx=12, pady=(0, 10))
+        else:
+            self.audio_meter = None
+            self.audio_status = None
+
+        screen_w = self.winfo_screenwidth()
+        self.geometry(f"+{screen_w - self.THUMB_WIDTH - 60}+56")
+        self.after(60, self._exclude_from_capture)
+        if show_video:
+            self.after(250, self._refresh_preview)
+
+    def _exclude_from_capture(self):
+        try:
+            raw_hwnd = self.winfo_id()
+            hwnd = ctypes.windll.user32.GetAncestor(raw_hwnd, self.GA_ROOT)
+            ctypes.windll.user32.SetWindowDisplayAffinity(hwnd, self.WDA_EXCLUDEFROMCAPTURE)
+        except Exception:
+            pass  # starší Windows — náhľad by sa nahral do záznamu, radšej ho nechať tak
+
+    def _refresh_preview(self):
+        if self._closed:
+            return
+        try:
+            with mss.mss() as sct:
+                if self._region:
+                    source = self._region
+                elif self._monitor_index and self._monitor_index < len(sct.monitors):
+                    source = sct.monitors[self._monitor_index]
+                else:
+                    source = sct.monitors[0]
+                shot = sct.grab(source)
+            img = Image.frombytes("RGB", shot.size, shot.rgb)
+            scale = self.THUMB_WIDTH / img.width
+            img = img.resize((self.THUMB_WIDTH, max(1, int(img.height * scale))))
+            self._ctk_image = ctk.CTkImage(light_image=img, dark_image=img, size=img.size)
+            if self.image_label:
+                self.image_label.configure(image=self._ctk_image, text="")
+        except Exception:
+            if self.image_label:
+                self.image_label.configure(text="Náhľad obrazu sa nepodarilo získať.")
+        self.after(self.REFRESH_MS, self._refresh_preview)
+
+    def set_audio_level(self, level):
+        if self._closed or not self.audio_meter:
+            return
+        self.audio_meter.set(min(max(level, 0.0), 1.0))
+        now = time.monotonic()
+        if level > SILENCE_THRESHOLD:
+            self._last_sound_time = now
+            self.audio_status.configure(text="✓ Zvuk počujem", text_color="#2f9e44")
+        elif now - self._last_sound_time > SILENCE_WARNING_SECONDS:
+            self.audio_status.configure(
+                text="⚠ Nepočujem žiadny zvuk — skontroluj zdroj zvuku v Nastaveniach",
+                text_color="orange",
+            )
+
+    def close(self):
+        self._closed = True
+        try:
+            self.destroy()
+        except Exception:
+            pass
 
 
 class SettingsDialog(ctk.CTkToplevel):
@@ -586,6 +698,7 @@ class App(ctk.CTk):
         self.silence_warning_shown = False
         self.output_path = None
         self.session_cost = 0.0
+        self.live_preview = None
 
         self._build_widgets()
         self.recording_indicator = RecordingIndicator(self)
@@ -705,6 +818,25 @@ class App(ctk.CTk):
     def _add_cost(self, delta_usd):
         self.msg_queue.put(("cost", delta_usd))
 
+    def _api_call_with_retry(self, step_description, func, *args, **kwargs):
+        """Kritické API volanie (syntéza, zlúčenie, changelog) s opakovaním pri
+        výpadku spojenia — SDK samo opakuje krátko, toto pridáva dlhšie pauzy."""
+        for attempt in range(1, CRITICAL_CALL_ATTEMPTS + 1):
+            try:
+                return func(*args, **kwargs)
+            except anthropic.APIConnectionError:
+                if attempt == CRITICAL_CALL_ATTEMPTS:
+                    raise RuntimeError(
+                        f"Krok „{step_description}“ opakovane zlyhal na výpadku "
+                        "internetového spojenia. Skontroluj pripojenie a skús znova — "
+                        "dočasné súbory (vrátane prepisu) zostali zachované."
+                    )
+                self._log(
+                    f"Výpadok spojenia pri kroku „{step_description}“ — skúšam znova "
+                    f"o {CRITICAL_CALL_RETRY_PAUSE} s (pokus {attempt}/{CRITICAL_CALL_ATTEMPTS})..."
+                )
+                time.sleep(CRITICAL_CALL_RETRY_PAUSE)
+
     # ---------- mode selection ----------
 
     def _on_app_mode_change(self, label):
@@ -803,11 +935,12 @@ class App(ctk.CTk):
         except OSError as exc:
             raise RuntimeError(f"Nepodarilo sa načítať súbor so stratégiou: {exc}")
 
-        client = anthropic.Anthropic(api_key=run_cfg["api_key"])
+        client = _make_api_client(run_cfg["api_key"])
         ai_model = run_cfg.get("ai_model", analyzer.DEFAULT_MODEL)
         cost_limit = run_cfg.get("cost_limit_usd", 0.0)
         worker_cost_total = 0.0
         notes = []
+        failed_parts = 0
         stopped_on_limit = False
         for doc_path in doc_paths:
             self._log(f"Čítam dokument: {doc_path.name}...")
@@ -821,9 +954,17 @@ class App(ctk.CTk):
                     stopped_on_limit = True
                     break
                 self._log(f"Analyzujem {doc_path.name} — časť {j}/{len(parts)}...")
-                note, usage = analyzer.analyze_document_part(
-                    client, part, doc_path.name, model=ai_model
-                )
+                try:
+                    note, usage = analyzer.analyze_document_part(
+                        client, part, doc_path.name, model=ai_model
+                    )
+                except anthropic.APIConnectionError:
+                    failed_parts += 1
+                    self._log(
+                        f"Časť {j}/{len(parts)} dokumentu {doc_path.name} sa nepodarilo "
+                        "analyzovať (výpadok spojenia) — pokračujem ďalšou časťou."
+                    )
+                    continue
                 cost_delta = analyzer.estimate_cost_usd(usage, ai_model)
                 worker_cost_total += cost_delta
                 self._add_cost(cost_delta)
@@ -833,17 +974,31 @@ class App(ctk.CTk):
                 break
 
         if not notes:
+            if failed_parts:
+                raise RuntimeError(
+                    "Analýza dokumentov zlyhala — internetové spojenie opakovane "
+                    "vypadávalo. Skontroluj pripojenie a skús to znova."
+                )
             raise RuntimeError(
                 "Z dokumentov sa nepodarilo získať žiadne konkrétne pravidlá stratégie."
             )
+        if failed_parts:
+            self._log(
+                f"Upozornenie: {failed_parts} častí sa pre výpadky spojenia "
+                "nepodarilo analyzovať — doplnenie bude o tieto časti chudobnejšie."
+            )
 
         self._log(f"Získaných poznámok: {len(notes)}. Zlučujem do stratégie {target.name}...")
-        final_text, merge_usage = analyzer.merge_notes(client, previous_text, notes, model=ai_model)
+        final_text, merge_usage = self._api_call_with_retry(
+            "zlúčenie do stratégie", analyzer.merge_notes,
+            client, previous_text, notes, model=ai_model,
+        )
         self._add_cost(analyzer.estimate_cost_usd(merge_usage, ai_model))
 
         self._log("Zapisujem zhrnutie zmien tejto aktualizácie...")
-        changelog_text, changelog_usage = analyzer.summarize_changes(
-            client, previous_text, final_text, model=ai_model
+        changelog_text, changelog_usage = self._api_call_with_retry(
+            "zhrnutie zmien", analyzer.summarize_changes,
+            client, previous_text, final_text, model=ai_model,
         )
         self._add_cost(analyzer.estimate_cost_usd(changelog_usage, ai_model))
 
@@ -951,6 +1106,17 @@ class App(ctk.CTk):
 
         self.recording = True
         self.recording_indicator.show()
+        # Živý náhľad: druhé okno s tým, čo appka práve vidí a počuje.
+        video_mode = self.cfg.get("video_source_mode", "all_monitors")
+        preview_region = self.cfg.get("screen_region") if video_mode == "region" else None
+        preview_monitor = self.cfg.get("monitor_index", 1) if video_mode == "monitor" else 0
+        self.live_preview = LivePreviewWindow(
+            self,
+            monitor_index=preview_monitor,
+            region=preview_region,
+            show_video=app_mode in ("full", "research", "video_only"),
+            show_audio=needs_audio,
+        )
         self.last_sound_time = time.monotonic()
         self.silence_warning_shown = False
         self.silence_warning_label.pack_forget()
@@ -967,6 +1133,9 @@ class App(ctk.CTk):
     def _stop_recording(self):
         self.recording = False
         self.recording_indicator.hide()
+        if self.live_preview:
+            self.live_preview.close()
+            self.live_preview = None
         self.course_name_for_run = self.course_name_entry.get().strip()
         self.append_target_for_run = self.append_target_path if self.append_var.get() else None
         self.start_stop_btn.configure(state="disabled", text="Spracúvam...")
@@ -994,6 +1163,8 @@ class App(ctk.CTk):
                 self._process_full_recording()
         except Exception as exc:
             self.msg_queue.put(("error", str(exc)))
+            if self.run_temp_dir and self.run_temp_dir.exists():
+                self._log(f"Dočasné súbory (nahrávka, prepis) zostali v: {self.run_temp_dir}")
         finally:
             self.msg_queue.put(("pipeline_done", None))
 
@@ -1061,13 +1232,22 @@ class App(ctk.CTk):
             )
         self._log(f"Prepis hotový ({len(segments)} úsekov, jazyk: {detected_language}).")
 
+        # Prepis stál najviac času — ulož ho hneď na disk, nech sa pri
+        # prípadnej neskoršej chybe (napr. výpadok internetu) nestratí.
+        try:
+            transcript_path = self.run_temp_dir / "prepis.txt"
+            transcript_path.write_text(transcribe.segments_to_text(segments), encoding="utf-8")
+        except OSError:
+            pass
+
         blocks = self._chunk_segments(segments)
         self._set_status("Analyzujem s AI...")
-        client = anthropic.Anthropic(api_key=run_cfg["api_key"])
+        client = _make_api_client(run_cfg["api_key"])
         ai_model = run_cfg.get("ai_model", analyzer.DEFAULT_MODEL)
         cost_limit = run_cfg.get("cost_limit_usd", 0.0)
         worker_cost_total = 0.0
         notes = []
+        failed_blocks = 0
         for i, (block_text, block_start, block_end) in enumerate(blocks, start=1):
             if cost_limit > 0 and worker_cost_total >= cost_limit:
                 self._log(
@@ -1077,9 +1257,19 @@ class App(ctk.CTk):
                 break
             block_screenshots = self._select_screenshots(screenshots, block_start, block_end)
             self._log(f"Analyzujem blok {i}/{len(blocks)} ({len(block_screenshots)} snímky)...")
-            note, usage = analyzer.analyze_segment(
-                client, block_text, block_screenshots, model=ai_model, system_prompt=note_system_prompt
-            )
+            try:
+                note, usage = analyzer.analyze_segment(
+                    client, block_text, block_screenshots, model=ai_model, system_prompt=note_system_prompt
+                )
+            except anthropic.APIConnectionError:
+                # Jediný výpadok spojenia nesmie zahodiť celú prácu — blok sa
+                # preskočí a pokračuje sa ďalším (SDK predtým samo skúšalo znova).
+                failed_blocks += 1
+                self._log(
+                    f"Blok {i}/{len(blocks)} sa nepodarilo analyzovať (výpadok "
+                    "internetového spojenia) — pokračujem ďalším blokom."
+                )
+                continue
             cost_delta = analyzer.estimate_cost_usd(usage, ai_model)
             worker_cost_total += cost_delta
             self._add_cost(cost_delta)
@@ -1095,6 +1285,18 @@ class App(ctk.CTk):
                         f"Pri tomto tempe: rozpočet (${cost_limit:.2f}) pokryje ešte "
                         f"cca {remaining_minutes:.0f} min obsahu videa."
                     )
+
+        if failed_blocks and not notes:
+            raise RuntimeError(
+                "Analýza zlyhala — internetové spojenie opakovane vypadávalo. "
+                "Skontroluj pripojenie a skús to znova. Prepis reči zostal "
+                "uložený v dočasnom priečinku (prepis.txt)."
+            )
+        if failed_blocks:
+            self._log(
+                f"Upozornenie: {failed_blocks} blokov sa pre výpadky spojenia "
+                "nepodarilo analyzovať — výstup bude o tieto časti chudobnejší."
+            )
 
         return notes, client, ai_model
 
@@ -1124,19 +1326,22 @@ class App(ctk.CTk):
             except OSError as exc:
                 raise RuntimeError(f"Nepodarilo sa načítať existujúci súbor: {exc}")
             self._log(f"Pridávam k existujúcej stratégii: {append_target.name}...")
-            final_text, synth_usage = analyzer.merge_notes(
-                client, previous_text, notes, model=ai_model
+            final_text, synth_usage = self._api_call_with_retry(
+                "zlúčenie do stratégie", analyzer.merge_notes,
+                client, previous_text, notes, model=ai_model,
             )
         else:
             self._log(f"Priebežných poznámok: {len(notes)}. Vytváram finálnu syntézu...")
-            final_text, synth_usage = analyzer.synthesize_notes(
-                client, notes, model=ai_model, system_prompt=analyzer.SYNTHESIS_SYSTEM_PROMPT
+            final_text, synth_usage = self._api_call_with_retry(
+                "finálna syntéza", analyzer.synthesize_notes,
+                client, notes, model=ai_model, system_prompt=analyzer.SYNTHESIS_SYSTEM_PROMPT,
             )
         self._add_cost(analyzer.estimate_cost_usd(synth_usage, ai_model))
 
         self._log("Zapisujem zhrnutie zmien tejto aktualizácie...")
-        changelog_text, changelog_usage = analyzer.summarize_changes(
-            client, previous_text, final_text, model=ai_model
+        changelog_text, changelog_usage = self._api_call_with_retry(
+            "zhrnutie zmien", analyzer.summarize_changes,
+            client, previous_text, final_text, model=ai_model,
         )
         self._add_cost(analyzer.estimate_cost_usd(changelog_usage, ai_model))
 
@@ -1188,8 +1393,9 @@ class App(ctk.CTk):
             raise RuntimeError("Z videa sa nepodarilo získať žiadny podstatný obsah.")
 
         self._log(f"Priebežných poznámok: {len(notes)}. Vytváram finálne zhrnutie...")
-        final_text, synth_usage = analyzer.synthesize_notes(
-            client, notes, model=ai_model, system_prompt=analyzer.RESEARCH_SYNTHESIS_SYSTEM_PROMPT
+        final_text, synth_usage = self._api_call_with_retry(
+            "finálne zhrnutie", analyzer.synthesize_notes,
+            client, notes, model=ai_model, system_prompt=analyzer.RESEARCH_SYNTHESIS_SYSTEM_PROMPT,
         )
         self._add_cost(analyzer.estimate_cost_usd(synth_usage, ai_model))
 
@@ -1276,6 +1482,8 @@ class App(ctk.CTk):
             self.status_label.configure(text=payload)
         elif kind == "level":
             self.vu_meter.set(min(max(payload, 0.0), 1.0))
+            if self.live_preview:
+                self.live_preview.set_audio_level(payload)
             if payload > SILENCE_THRESHOLD:
                 self.last_sound_time = time.monotonic()
                 if self.silence_warning_shown:

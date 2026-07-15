@@ -54,13 +54,16 @@ def get_desktop_dir():
     )
 
 
-def create_desktop_shortcut():
+def create_desktop_shortcut(target=None):
     """Vytvorí (alebo prepíše) odkaz na program na pracovnej ploche. Vráti cestu
-    k odkazu. Odkaz sa vytvára cez PowerShell v samostatnom procese, aby sa
+    k odkazu. `target` = cesta k .exe; bez neho sa použije aktuálne bežiaci
+    program. Odkaz sa vytvára cez PowerShell v samostatnom procese, aby sa
     nezasahovalo do COM stavu appky (pycaw/soundcard)."""
     import subprocess
 
-    if getattr(sys, "frozen", False):
+    if target is not None:
+        target = Path(target).resolve()
+    elif getattr(sys, "frozen", False):
         target = Path(sys.executable).resolve()
     else:
         # Pri vývoji zo zdrojáku by odkaz nemal zmysel — ukáž na run.py cez python.
