@@ -5,6 +5,7 @@ import os
 import queue
 import re
 import shutil
+import sys
 import threading
 import time
 import tkinter as tk
@@ -398,12 +399,26 @@ class SettingsDialog(ctk.CTkToplevel):
         self.keep_temp_var = ctk.BooleanVar(value=self.cfg.get("keep_temp_files", False))
         ctk.CTkCheckBox(
             body, text="Ponechať dočasné súbory (screenshoty, zvuk)", variable=self.keep_temp_var
-        ).pack(anchor="w", pady=(10, 20), padx=16)
+        ).pack(anchor="w", pady=(10, 10), padx=16)
+
+        ctk.CTkButton(
+            body, text="Vytvoriť odkaz na pracovnej ploche", width=260,
+            fg_color="gray35", hover_color="gray25", command=self._on_create_shortcut,
+        ).pack(anchor="w", pady=(4, 20), padx=16)
 
         btn_frame = ctk.CTkFrame(self, fg_color="transparent")
         btn_frame.pack(fill="x", padx=16, pady=(8, 16))
         ctk.CTkButton(btn_frame, text="Zrušiť", fg_color="gray", command=self.destroy).pack(side="right")
         ctk.CTkButton(btn_frame, text="Uložiť", command=self._save).pack(side="right", padx=(0, 8))
+
+    def _on_create_shortcut(self):
+        try:
+            shortcut_path = paths.create_desktop_shortcut()
+            messagebox.showinfo(
+                "Odkaz na ploche", f"Odkaz vytvorený: {shortcut_path}", parent=self
+            )
+        except Exception as exc:
+            messagebox.showerror("Odkaz na ploche", str(exc), parent=self)
 
     def _on_encrypt_toggle(self):
         if self.encrypt_var.get():
@@ -575,6 +590,30 @@ class App(ctk.CTk):
         self._build_widgets()
         self.recording_indicator = RecordingIndicator(self)
         self.after(50, self._poll_queue)
+        self.after(800, self._maybe_offer_desktop_shortcut)
+
+    def _maybe_offer_desktop_shortcut(self):
+        """Pri úplne prvom spustení zabalenej appky raz ponúkne vytvorenie odkazu
+        na pracovnej ploche (nič sa nevytvára bez súhlasu používateľa)."""
+        if not getattr(sys, "frozen", False) or self.cfg.get("desktop_shortcut_offered"):
+            return
+        self.cfg["desktop_shortcut_offered"] = True
+        config_module.save(self.cfg)
+        if messagebox.askyesno(
+            "Odkaz na ploche",
+            "Chceš vytvoriť odkaz na StrategyScribe na pracovnej ploche?\n\n"
+            "(Kedykoľvek neskôr sa dá vytvoriť v Nastaveniach.)",
+        ):
+            self._create_desktop_shortcut()
+
+    def _create_desktop_shortcut(self):
+        try:
+            shortcut_path = paths.create_desktop_shortcut()
+            self._append_log(f"Odkaz na ploche vytvorený: {shortcut_path.name}")
+            return True
+        except Exception as exc:
+            messagebox.showerror("Odkaz na ploche", str(exc))
+            return False
 
     def _build_widgets(self):
         top = ctk.CTkFrame(self, fg_color="transparent")
