@@ -1234,6 +1234,7 @@ class App(ctk.CTk):
         transcriber = transcribe.Transcriber(
             model_size=run_cfg.get("whisper_model", "medium"),
             language=whisper_language,
+            on_log=self._log,
         )
         segments, detected_language = transcriber.transcribe(audio_path)
         if not segments:

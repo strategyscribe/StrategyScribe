@@ -15,25 +15,40 @@ class TranscriptSegment:
 class Transcriber:
     """device="auto" skúsi najprv GPU (cuda), ak zlyhá (chýbajúce CUDA/cuDNN
     knižnice sa prejavia až pri reálnom výpočte, nie pri vytvorení modelu),
-    automaticky sa prepne na CPU a prepis zopakuje."""
+    automaticky sa prepne na CPU a prepis zopakuje.
 
-    def __init__(self, model_size="medium", device="auto", language=None):
+    on_log (voliteľné) sa zavolá s textom o tom, na čom appka reálne beží —
+    bez toho je prípadný pád na CPU úplne neviditeľný a prepis môže trvať
+    rádovo dlhšie bez akéhokoľvek vysvetlenia v logu appky."""
+
+    def __init__(self, model_size="medium", device="auto", language=None, on_log=None):
         self.model_size = model_size
         self.language = language
+        self._on_log = on_log or (lambda text: None)
         self._device = "cuda" if device == "auto" else device
         self._load(self._device)
 
     def _load(self, device):
         compute_type = "float16" if device == "cuda" else "int8"
-        self.model = WhisperModel(self.model_size, device=device, compute_type=compute_type)
+        # cpu_threads=0 necháva CTranslate2 použiť všetky dostupné jadrá
+        # procesora — bez tohto niekedy beží len na časti jadier a prepis na
+        # CPU je zbytočne pomalší.
+        kwargs = {"cpu_threads": 0} if device == "cpu" else {}
+        self.model = WhisperModel(self.model_size, device=device, compute_type=compute_type, **kwargs)
         self._device = device
+        self._on_log(
+            "Prepis beží na grafickej karte (GPU)." if device == "cuda"
+            else "Prepis beží na procesore (CPU) — pri modeli 'medium'/'large' to môže "
+                 "trvať výrazne dlhšie než na GPU."
+        )
 
     def transcribe(self, audio_path):
         """Vráti (zoznam TranscriptSegment, detegovaný jazyk)."""
         try:
             return self._transcribe_once(audio_path)
-        except RuntimeError:
+        except RuntimeError as exc:
             if self._device != "cpu":
+                self._on_log(f"Grafická karta zlyhala ({exc}) — prepínam na procesor...")
                 self._load("cpu")
                 return self._transcribe_once(audio_path)
             raise
