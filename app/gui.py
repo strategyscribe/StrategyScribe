@@ -20,6 +20,7 @@ from PIL import Image
 from tkinter import filedialog, messagebox
 
 from . import analyzer, capture, config as config_module, documents, docx_export, paths, security, transcribe
+from .version import APP_VERSION
 
 ctk.set_appearance_mode("system")
 ctk.set_default_color_theme("blue")
@@ -679,7 +680,7 @@ class SettingsDialog(ctk.CTkToplevel):
 class App(ctk.CTk):
     def __init__(self):
         super().__init__()
-        self.title("StrategyScribe")
+        self.title(f"StrategyScribe v{APP_VERSION}")
         self.geometry("640x560")
         self.minsize(560, 460)
 

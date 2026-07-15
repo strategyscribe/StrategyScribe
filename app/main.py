@@ -17,8 +17,7 @@ from tkinter import messagebox, ttk
 from urllib.request import Request, urlopen
 
 from . import config as config_module, gui
-
-APP_VERSION = "0.1.4"
+from .version import APP_VERSION
 GITHUB_REPO = "strategyscribe/StrategyScribe"
 # Repozitár bol presunutý z tomako21/StrategyScribe pod organizáciu — stará
 # adresa presmerováva na novú, obe sú dôveryhodné pre bezpečnostnú kontrolu.
