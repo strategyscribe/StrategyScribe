@@ -39,6 +39,7 @@ DEFAULT_CONFIG = {
     "encryption_public_key_pem": "",  # verejný RSA kľúč z Bot Z / Aurion (PEM text)
     "keep_temp_files": False,
     "desktop_shortcut_offered": False,  # jednorazová ponuka odkazu na ploche pri prvom spustení
+    "install_prompt_declined": False,  # používateľ odmietol inštaláciu na stále miesto — nepýtať sa znova
 }
 
 

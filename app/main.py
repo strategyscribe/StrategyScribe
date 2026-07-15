@@ -1,5 +1,6 @@
-"""Vstupný bod aplikácie — najprv overí aktualizácie (a ponúkne automatickú
-inštaláciu novej verzie, ak beží ako zbalené .exe), potom spustí GUI."""
+"""Vstupný bod aplikácie — najprv ponúkne inštaláciu na stále miesto (ak beží
+zo stiahnutej kópie), potom overí aktualizácie (a ponúkne automatickú
+inštaláciu novej verzie, ak beží ako zbalené .exe), nakoniec spustí GUI."""
 
 import hashlib
 import json
@@ -15,9 +16,9 @@ from pathlib import Path
 from tkinter import messagebox, ttk
 from urllib.request import Request, urlopen
 
-from . import gui
+from . import config as config_module, gui
 
-APP_VERSION = "0.1.3"
+APP_VERSION = "0.1.4"
 GITHUB_REPO = "strategyscribe/StrategyScribe"
 # Repozitár bol presunutý z tomako21/StrategyScribe pod organizáciu — stará
 # adresa presmerováva na novú, obe sú dôveryhodné pre bezpečnostnú kontrolu.
@@ -321,7 +322,140 @@ def _prompt_update(info):
             webbrowser.open(info["release_url"])
 
 
+def _install_dir():
+    """Stále miesto programu — per-user, bez admin práv (ako napr. VS Code)."""
+    base = os.environ.get("LOCALAPPDATA") or str(Path.home() / "AppData" / "Local")
+    return Path(base) / "Programs" / "StrategyScribe"
+
+
+def _spawn_downloaded_copy_cleanup(downloaded_exe, delete_config_too):
+    """Asynchrónne zmaže stiahnutú kópiu .exe (a prípadne jej config.json) po
+    tom, čo úplne skončia všetky jej procesy — rovnaký vzor ako pri aktualizácii."""
+    bat_path = Path(tempfile.gettempdir()) / "strategyscribe_install_cleanup.bat"
+    ps_still_running = (
+        f"if (Get-Process | Where-Object {{ $_.Path -eq '{downloaded_exe}' }}) "
+        "{ exit 1 } else { exit 0 }"
+    )
+    config_line = ""
+    if delete_config_too:
+        config_line = f'del "{downloaded_exe.parent / "config.json"}" >NUL 2>&1\r\n'
+    bat_content = (
+        "@echo off\r\n"
+        ":wait\r\n"
+        f'powershell -NoProfile -Command "{ps_still_running}"\r\n'
+        "if errorlevel 1 (\r\n"
+        "    timeout /t 1 /nobreak >NUL\r\n"
+        "    goto wait\r\n"
+        ")\r\n"
+        "timeout /t 1 /nobreak >NUL\r\n"
+        "set DEL_RETRY=0\r\n"
+        ":delloop\r\n"
+        f'del "{downloaded_exe}" >NUL 2>&1\r\n'
+        f'if exist "{downloaded_exe}" (\r\n'
+        "    set /a DEL_RETRY+=1\r\n"
+        "    if %DEL_RETRY% GEQ 10 goto cleanup\r\n"
+        "    timeout /t 1 /nobreak >NUL\r\n"
+        "    goto delloop\r\n"
+        ")\r\n"
+        f"{config_line}"
+        ":cleanup\r\n"
+        'del "%~f0"\r\n'
+    )
+    bat_path.write_text(bat_content, encoding="utf-8")
+    subprocess.Popen(
+        ["cmd.exe", "/c", str(bat_path)],
+        creationflags=DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP,
+        close_fds=True,
+    )
+
+
+def _self_install_check():
+    """Ak program beží zo stiahnutej kópie (mimo stáleho miesta), ponúkne
+    inštaláciu — skopíruje sa do LOCALAPPDATA\\Programs\\StrategyScribe,
+    prenesie nastavenia, spustí nainštalovanú kópiu a stiahnutý súbor zmaže.
+    Takto sa na disku nehromadia kópie z každého stiahnutia. Pri odmietnutí
+    si voľbu zapamätá (config vedľa .exe) a už sa nepýta."""
+    if not getattr(sys, "frozen", False):
+        return
+
+    current_exe = Path(sys.executable).resolve()
+    install_dir = _install_dir()
+    installed_exe = install_dir / "StrategyScribe.exe"
+    if current_exe.parent == install_dir:
+        return  # už bežíme z nainštalovaného miesta
+
+    cfg = config_module.load()
+    if cfg.get("install_prompt_declined"):
+        return
+
+    root = tk.Tk()
+    root.withdraw()
+    if installed_exe.exists():
+        question = (
+            f"StrategyScribe je už nainštalovaný v:\n{install_dir}\n\n"
+            "Chceš nainštalovanú verziu nahradiť touto kópiou a spustiť ju?\n"
+            "Táto stiahnutá kópia sa potom automaticky zmaže, aby sa na disku "
+            "nehromadili staré verzie.\n\n"
+            "(Nie = program pobeží priamo z tohto súboru a už sa nebude pýtať.)"
+        )
+    else:
+        question = (
+            f"Chceš StrategyScribe nainštalovať na stále miesto?\n{install_dir}\n\n"
+            "Program tak bude na jednom mieste (odkaz na ploche aj aktualizácie "
+            "budú vždy smerovať naň) a táto stiahnutá kópia sa po inštalácii "
+            "automaticky zmaže.\n\n"
+            "(Nie = program pobeží priamo z tohto súboru a už sa nebude pýtať.)"
+        )
+    should_install = messagebox.askyesno("Inštalácia StrategyScribe", question)
+    if not should_install:
+        root.destroy()
+        cfg["install_prompt_declined"] = True
+        config_module.save(cfg)
+        return
+
+    try:
+        install_dir.mkdir(parents=True, exist_ok=True)
+        for attempt in range(3):
+            try:
+                shutil.copy2(current_exe, installed_exe)
+                break
+            except OSError:
+                if attempt == 2:
+                    raise RuntimeError(
+                        "nainštalovaná verzia je pravdepodobne práve spustená — "
+                        "zatvor ju a skús to znova"
+                    )
+                time.sleep(1)
+        # Prenes nastavenia (API kľúč atď.), ale neprepisuj existujúce na cieli.
+        current_config = current_exe.parent / "config.json"
+        installed_config = install_dir / "config.json"
+        config_migrated = False
+        if current_config.exists() and not installed_config.exists():
+            shutil.copy2(current_config, installed_config)
+            config_migrated = True
+    except Exception as exc:
+        messagebox.showerror(
+            "Inštalácia zlyhala",
+            f"Program sa nepodarilo nainštalovať ({exc}).\n\n"
+            "Pobeží zatiaľ priamo z tohto súboru.",
+        )
+        root.destroy()
+        return
+
+    root.destroy()
+    # Spusti nainštalovanú kópiu ako nezávislú inštanciu (reset PyInstaller
+    # prostredia — inak by hľadala rozbalené súbory tejto končiacej kópie).
+    env = dict(os.environ)
+    env["PYINSTALLER_RESET_ENVIRONMENT"] = "1"
+    subprocess.Popen(
+        [str(installed_exe)], cwd=str(install_dir), env=env, close_fds=True
+    )
+    _spawn_downloaded_copy_cleanup(current_exe, delete_config_too=config_migrated)
+    os._exit(0)
+
+
 def main():
+    _self_install_check()
     info = check_for_update()
     if info:
         _prompt_update(info)
