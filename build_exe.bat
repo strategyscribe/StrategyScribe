@@ -1,6 +1,6 @@
 @echo off
 echo Balim StrategyScribe do .exe...
-pyinstaller --onefile --windowed --noconfirm --name StrategyScribe --collect-data customtkinter --collect-data faster_whisper --collect-data imageio_ffmpeg run.py
+pyinstaller --onefile --windowed --noconfirm --name StrategyScribe --icon app\icon.ico --collect-data customtkinter --collect-data faster_whisper --collect-data imageio_ffmpeg run.py
 if errorlevel 1 goto :eof
 
 echo.
