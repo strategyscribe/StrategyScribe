@@ -40,6 +40,8 @@ DEFAULT_CONFIG = {
     "keep_temp_files": False,
     "desktop_shortcut_offered": False,  # jednorazová ponuka odkazu na ploche pri prvom spustení
     "install_prompt_declined": False,  # používateľ odmietol inštaláciu na stále miesto — nepýtať sa znova
+    "append_enabled": False,  # stav zaškrtávacieho políčka "Pridať do existujúcej stratégie"
+    "append_target_path": "",  # naposledy vybraný súbor so stratégiou (na doplnenie/pridanie)
 }
 
 

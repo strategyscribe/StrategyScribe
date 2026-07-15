@@ -751,7 +751,11 @@ class App(ctk.CTk):
         ).pack(side="left", padx=(8, 0))
 
         self.append_frame = ctk.CTkFrame(self, fg_color="transparent")
-        self.append_var = ctk.BooleanVar(value=False)
+        # Zapamätaný stav z minula (checkbox aj naposledy vybraný súbor) — nech
+        # to netreba nastavovať znova pri každom spustení appky.
+        restored_path = self.cfg.get("append_target_path") or ""
+        self.append_target_path = Path(restored_path) if restored_path and Path(restored_path).exists() else None
+        self.append_var = ctk.BooleanVar(value=bool(self.cfg.get("append_enabled")) and self.append_target_path is not None)
         ctk.CTkCheckBox(
             self.append_frame, text="Pridať do existujúcej stratégie (namiesto novej)",
             variable=self.append_var, command=self._on_append_toggle,
@@ -764,8 +768,9 @@ class App(ctk.CTk):
             fg_color="gray35", hover_color="gray25", command=self._on_add_documents,
         )
         self.docs_btn.pack(side="right")
-        self.append_target_path = None
         self.append_target_label = ctk.CTkLabel(self, text="", text_color="gray70")
+        if self.append_target_path:
+            self.append_target_label.configure(text=f"Pridá sa do: {self.append_target_path.name}")
         self._update_append_visibility()
 
         self.start_stop_btn = ctk.CTkButton(
@@ -866,6 +871,8 @@ class App(ctk.CTk):
         else:
             self.append_file_btn.pack_forget()
             self.append_target_label.pack_forget()
+        self.cfg["append_enabled"] = self.append_var.get()
+        config_module.save(self.cfg)
 
     def _on_add_documents(self):
         """Doplnenie existujúcej stratégie z dokumentov (PDF/Word/text) — bez nahrávania."""
@@ -1031,6 +1038,8 @@ class App(ctk.CTk):
             self.append_target_path = Path(chosen)
             self.append_target_label.configure(text=f"Pridá sa do: {self.append_target_path.name}")
             self.append_target_label.pack(anchor="w", padx=20, pady=(0, 8))
+            self.cfg["append_target_path"] = str(self.append_target_path)
+            config_module.save(self.cfg)
 
     # ---------- Start / Stop ----------
 
